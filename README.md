@@ -108,15 +108,9 @@ pip install -r requirements.txt
 - `requests` - API调用
 - `PyMuPDF` - PDF处理
 
-#### 3. 安装并启动IOPaint服务
+#### 3. 安装并启动IOPaint服务 参考如下
 
-```bash
-# 安装IOPaint
-pip install iopaint
-
-# 启动服务（默认端口8080）
-iopaint start --host 127.0.0.1 --port 8080
-```
+https://www.iopaint.com/install/windows_1click_installer
 
 > 💡 **提示**：IOPaint支持CPU和GPU模式，GPU可大幅提升处理速度
 
