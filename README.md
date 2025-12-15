@@ -55,8 +55,9 @@
 
 ```bash
 # 克隆项目
+解压ppt_editor_ocr.rar
 git clone <repository-url>
-cd ppt_editor_modular
+cd ppt_editor_ocr
 
 # 安装依赖
 pip install -r requirements.txt
@@ -104,7 +105,7 @@ python run_ppt_editor.py
 ## 🗂️ 项目结构
 
 ```
-ppt_editor_modular/
+ppt_editor_ocr/
 ├── __init__.py                 # 包初始化
 ├── __main__.py                 # 模块入口
 ├── run_ppt_editor.py          # 原启动脚本
@@ -348,11 +349,12 @@ pylint ppt_editor_modular/
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=star-history/star-history&type=date&legend=top-left)](https://www.star-history.com/#star-history/star-history&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=Tansuo2021/OCRPDF-TO-PPT&type=date&legend=top-left)](https://www.star-history.com/#Tansuo2021/OCRPDF-TO-PPT&type=date&legend=top-left)
 如果这个项目对你有帮助，请给一个星标！
 
 ---
 
 *Powered by Python 🐍 | Made with ❤️*
+
 
 
