@@ -6,6 +6,8 @@
 效果图：
 <img width="1600" height="857" alt="image" src="https://github.com/user-attachments/assets/d5c194f5-b5dd-4638-b774-5abd735c1622" />
 <img width="1600" height="857" alt="image" src="https://github.com/user-attachments/assets/836311b3-0af8-4f91-a55d-0e822457f71f" />
+2026.1.5更新增加GPU版本
+![PixPin_2026-01-05_23-37-10](https://github.com/user-attachments/assets/9fe98fe2-bd77-487e-9fdf-d93146b1fa7e)
 
 ## ✨ 主要功能
 
@@ -355,6 +357,7 @@ pylint ppt_editor_modular/
 ---
 
 *Powered by Python 🐍 | Made with ❤️*
+
 
 
 
