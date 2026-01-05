@@ -8,6 +8,20 @@
 <img width="1600" height="857" alt="image" src="https://github.com/user-attachments/assets/836311b3-0af8-4f91-a55d-0e822457f71f" />
 2026.1.5更新增加GPU版本
 ![PixPin_2026-01-05_23-37-10](https://github.com/user-attachments/assets/9fe98fe2-bd77-487e-9fdf-d93146b1fa7e)
+## 使用方式，
+下载ppt_editor_ocr_GPU.zip
+## 然后GPU版本安装方式：
+# GPU 版本，需显卡驱动程序版本 ≥450.80.02（Linux）或 ≥452.39（Windows）
+python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+
+# GPU 版本，需显卡驱动程序版本 ≥550.54.14（Linux）或 ≥550.54.14（Windows）
+python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+
+接下来运行安装requirements.txt这个文件
+py run.py
+即可！
+本次升级参考如下，速度提升超强！
+<img width="1600" height="857" alt="image" src="https://github.com/user-attachments/assets/9fe98fe2-bd77-487e-9fdf-d93146b1fa7e" />
 
 ## ✨ 主要功能
 
@@ -357,6 +371,7 @@ pylint ppt_editor_modular/
 ---
 
 *Powered by Python 🐍 | Made with ❤️*
+
 
 
 
