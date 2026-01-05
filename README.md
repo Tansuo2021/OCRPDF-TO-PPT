@@ -11,10 +11,10 @@
 ## 使用方式，
 下载ppt_editor_ocr_GPU.zip
 ## 然后GPU版本安装方式：
-# GPU 版本，需显卡驱动程序版本 ≥450.80.02（Linux）或 ≥452.39（Windows）
+### GPU 版本，需显卡驱动程序版本 ≥450.80.02（Linux）或 ≥452.39（Windows）
 python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 
-# GPU 版本，需显卡驱动程序版本 ≥550.54.14（Linux）或 ≥550.54.14（Windows）
+### GPU 版本，需显卡驱动程序版本 ≥550.54.14（Linux）或 ≥550.54.14（Windows）
 python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
 
 接下来运行安装requirements.txt这个文件
@@ -371,6 +371,7 @@ pylint ppt_editor_modular/
 ---
 
 *Powered by Python 🐍 | Made with ❤️*
+
 
 
 
