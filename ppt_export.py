@@ -216,7 +216,10 @@ class PPTExporter:
                 except Exception:
                     font_size = None
             if font_size is None:
-                font_size = self.fit_font_size(text, w, h, padding_x=2, padding_y=2)
+                # 计算字体大小，并应用 0.88 的缩小系数
+                # 因为 PPT 的文本渲染引擎与画布预览不同，实际显示会偏大
+                calculated_size = self.fit_font_size(text, w, h, padding_x=2, padding_y=2)
+                font_size = int(calculated_size * 0.70)  # 缩小 12% 以匹配画布预览
             p.font.size = Pt(int(font_size))
 
             print(f"    文本框尺寸: {w}x{h}px, 字体: {font_size}pt")
@@ -314,7 +317,7 @@ class PPTExporter:
         except Exception:
             pass
 
-    def fit_font_size(self, text, box_w_px, box_h_px, min_pt=6, max_pt=72, dpi=96, padding_x=6, padding_y=2):
+    def fit_font_size(self, text, box_w_px, box_h_px, min_pt=6, max_pt=200, dpi=96, padding_x=6, padding_y=2):
         """
         使用二分查找法计算最佳字体大小，确保文字能完全适配文本框
 
@@ -323,7 +326,7 @@ class PPTExporter:
             box_w_px: 文本框宽度（像素）
             box_h_px: 文本框高度（像素）
             min_pt: 最小字体大小（pt）
-            max_pt: 最大字体大小（pt）
+            max_pt: 最大字体大小（pt），默认200以支持大尺寸图片
             dpi: DPI（默认96）
             padding_x: 水平padding（像素）
             padding_y: 垂直padding（像素）

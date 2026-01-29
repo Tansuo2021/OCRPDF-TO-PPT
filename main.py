@@ -7,6 +7,7 @@ import re
 import shutil
 import platform
 import contextlib
+import logging
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout,
@@ -17,14 +18,17 @@ from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
     QSizePolicy,
     QColorDialog,
+    QComboBox,
     QScrollArea
 )
-from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer, QPointF, QPoint, QUrl
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer, QPointF, QPoint, QUrl, QLocale
 from PySide6.QtGui import (
     QPixmap, QPen, QColor, QFont, QFontMetricsF, QTextOption, QImage, QIcon, QBrush, QAction, QKeySequence, QDesktopServices
 )
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # === Windows: suppress console flash from OCR deps (subprocess spawned during import/init) ===
 @contextlib.contextmanager
@@ -138,13 +142,39 @@ def parse_inpaint_api_urls(value):
         out.append(key)
     return out
 
+def _t_sys(zh: str, en: str = None) -> str:
+    """Translate by system locale (used before app settings/UI language are loaded)."""
+    try:
+        loc = (QLocale.system().name() or "").lower()  # e.g. "zh_CN"
+        if loc.startswith("zh"):
+            return zh
+    except Exception:
+        pass
+    return en if en is not None else zh
+
+_UI_LANG = None  # "zh" / "en"; set by PPTCloneApp once settings are loaded.
+
+def _t_global(zh: str, en: str = None) -> str:
+    """Translate using the app UI language when available; fallback to system locale."""
+    try:
+        lang = (str(_UI_LANG or "") or "").strip().lower()
+        if not lang or lang == "auto":
+            lang = (QLocale.system().name() or "").lower()
+        if lang.startswith("zh"):
+            return zh
+        return en if en is not None else zh
+    except Exception:
+        return en if en is not None else zh
+
 # === 依赖检查 ===
+_missing_qtawesome = False
 try:
     import qtawesome as qta
 except ImportError:
-    app = QApplication(sys.argv)
-    QMessageBox.critical(None, "缺少库", "请运行 pip install qtawesome")
-    sys.exit(1)
+    _missing_qtawesome = True
+
+# 注意：QApplication 必须在主入口处创建，不能在依赖检查时创建
+# 否则会导致后续的 QApplication 实例无法正常使用
 
 # === OCR/PPT 导出导入 ===
 # 注意：为了让 PaddleX 缓存目录生效（PADDLE_PDX_CACHE_HOME），OCR 引擎必须在设置环境变量后再 import 初始化。
@@ -394,16 +424,16 @@ class OCRRoiThread(QThread):
     def run(self):
         try:
             if not self.image_path or not os.path.exists(self.image_path):
-                raise RuntimeError("图片不存在")
+                raise RuntimeError(_t_global("图片不存在", "Image not found"))
             if not (isinstance(self.roi, (list, tuple)) and len(self.roi) == 4):
-                raise RuntimeError("未设置选区")
+                raise RuntimeError(_t_global("未设置选区", "ROI is not set"))
             x, y, w, h = [int(v) for v in self.roi]
             if w <= 0 or h <= 0:
-                raise RuntimeError("选区无效")
+                raise RuntimeError(_t_global("选区无效", "Invalid ROI"))
 
             img = cv2.imread(self.image_path)
             if img is None:
-                raise RuntimeError("无法读取图片")
+                raise RuntimeError(_t_global("无法读取图片", "Failed to read image"))
 
             H, W = img.shape[:2]
             x = max(0, min(x, W - 1))
@@ -585,7 +615,12 @@ class InpaintThread(QThread):
 
             resp = requests.post(str(url), json=payload, timeout=self.timeout_sec)
             if resp.status_code != 200:
-                raise RuntimeError(f"IOPaint API返回错误: {resp.status_code} {resp.text[:200]}")
+                raise RuntimeError(
+                    _t_global(
+                        f"IOPaint API返回错误: {resp.status_code} {resp.text[:200]}",
+                        f"IOPaint API error: {resp.status_code} {resp.text[:200]}",
+                    )
+                )
 
             res_crop = Image.open(BytesIO(resp.content)).convert("RGB")
             return (crop_box, res_crop, crop_mask)
@@ -603,9 +638,10 @@ class InpaintThread(QThread):
                 if not boxes_raw:
                     self.progress.emit(done, total)
                     continue
+
                 api_urls = list(getattr(self, "api_urls", []) or [])
                 if not api_urls:
-                    raise RuntimeError("未设置 IOPaint API 地址")
+                    raise RuntimeError(_t_global("未设置 IOPaint API 地址", "IOPaint API URL is not set"))
 
                 # By default inpaint the original image; when iterative mode is desired, callers can
                 # pass `input_image_by_src[src] = <inpainted_variant_path>`.
@@ -650,6 +686,7 @@ class InpaintThread(QThread):
                 if not sortable:
                     self.progress.emit(done, total)
                     continue
+
                 sortable.sort(key=lambda t: (t[0], t[1]))
                 boxes = [t[2] for t in sortable]
 
@@ -701,7 +738,7 @@ class InpaintThread(QThread):
                             except Exception as e:
                                 last_err = e
                                 continue
-                        raise last_err or RuntimeError("IOPaint 请求失败")
+                        raise last_err or RuntimeError(_t_global("IOPaint 请求失败", "IOPaint request failed"))
 
                     results = []
                     with ThreadPoolExecutor(max_workers=min(len(api_urls), len(tasks))) as ex:
@@ -804,49 +841,51 @@ class ShortcutsDialog(QDialog):
     """A small, scrollable shortcut cheat-sheet."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("快捷键")
+        tr = getattr(parent, "_t", None)
+        self._t = tr if callable(tr) else (lambda zh, en=None: zh)
+        self.setWindowTitle(self._t("快捷键", "Shortcuts"))
         self.resize(560, 420)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
 
-        title = QLabel("常用快捷键")
+        title = QLabel(self._t("常用快捷键", "Keyboard shortcuts"))
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
         root.addWidget(title)
 
-        tips = QLabel("提示：Ctrl+滚轮缩放画布；按住滚轮拖动可平移画布。")
+        tips = QLabel(self._t("提示：Ctrl+滚轮缩放画布；按住滚轮拖动可平移画布。", "Tip: Ctrl+Wheel to zoom; hold Wheel to pan."))
         tips.setStyleSheet("color: #666;")
         root.addWidget(tips)
 
         rows = [
-            ("Ctrl+滚轮", "缩放画布"),
-            ("滚轮按住拖动", "平移画布"),
-            ("Ctrl+0", "适应窗口"),
-            ("Ctrl++ / Ctrl+-", "缩放（10%步进）"),
-            ("Ctrl+V", "粘贴文本框（无选中时：若剪贴板是截图/图片则直接导入）"),
-            ("Ctrl+Shift+V", "粘贴图片（从剪贴板导入截图/图片）"),
-            ("Ctrl+O", "导入图片"),
-            ("Ctrl+Shift+O", "导入PDF"),
-            ("Ctrl+Enter", "OCR本页"),
-            ("Ctrl+R", "OCR全部"),
-            ("Ctrl+I", "IOPaint去字（本页）"),
-            ("Ctrl+Shift+I", "IOPaint去字（全部）"),
-            ("Ctrl+S", "导出PPT"),
-            ("F5", "预览PPT"),
-            ("Ctrl+N", "新建空白页"),
-            ("Ctrl+D", "复制当前页"),
-            ("Alt+Up / Alt+Down", "上移/下移当前页"),
-            ("PageUp / PageDown", "上一页/下一页"),
-            ("Delete", "删除选中文本框"),
-            ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
-            ("Ctrl+Alt+L", "显示/隐藏缩略图"),
-            ("Ctrl+Alt+R", "显示/隐藏右侧面板"),
-            ("F1", "打开本快捷键窗口"),
+            (self._t("Ctrl+滚轮", "Ctrl+Wheel"), self._t("缩放画布", "Zoom canvas")),
+            (self._t("滚轮按住拖动", "Wheel drag"), self._t("平移画布", "Pan canvas")),
+            ("Ctrl+0", self._t("适应窗口", "Fit to window")),
+            ("Ctrl++ / Ctrl+-", self._t("缩放（10%步进）", "Zoom (10% step)")),
+            ("Ctrl+V", self._t("粘贴文本框（无选中时：若剪贴板是截图/图片则直接导入）", "Paste box (if none selected: paste image/screenshot as slide)")),
+            ("Ctrl+Shift+V", self._t("粘贴图片（从剪贴板导入截图/图片）", "Paste image (from clipboard)")),
+            ("Ctrl+O", self._t("导入图片", "Import images")),
+            ("Ctrl+Shift+O", self._t("导入PDF", "Import PDF")),
+            ("Ctrl+Enter", self._t("OCR本页", "OCR current")),
+            ("Ctrl+R", self._t("OCR全部", "OCR all")),
+            ("Ctrl+I", self._t("IOPaint去字（本页）", "IOPaint clean (current)")),
+            ("Ctrl+Shift+I", self._t("IOPaint去字（全部）", "IOPaint clean (all)")),
+            ("Ctrl+S", self._t("导出PPT", "Export PPT")),
+            ("F5", self._t("预览PPT", "Preview PPT")),
+            ("Ctrl+N", self._t("新建空白页", "New blank slide")),
+            ("Ctrl+D", self._t("复制当前页", "Duplicate slide")),
+            ("Alt+Up / Alt+Down", self._t("上移/下移当前页", "Move slide up/down")),
+            ("PageUp / PageDown", self._t("上一页/下一页", "Previous/Next slide")),
+            ("Delete", self._t("删除选中文本框", "Delete selected box")),
+            ("Ctrl+Z / Ctrl+Y", self._t("撤销 / 重做", "Undo / Redo")),
+            ("Ctrl+Alt+L", self._t("显示/隐藏缩略图", "Toggle thumbnails")),
+            ("Ctrl+Alt+R", self._t("显示/隐藏右侧面板", "Toggle right panel")),
+            ("F1", self._t("打开本快捷键窗口", "Open this window")),
         ]
 
         table = QTableWidget(len(rows), 2, self)
-        table.setHorizontalHeaderLabels(["快捷键", "功能"])
+        table.setHorizontalHeaderLabels([self._t("快捷键", "Shortcut"), self._t("功能", "Action")])
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setSelectionMode(QTableWidget.SingleSelection)
@@ -877,7 +916,7 @@ class ShortcutsDialog(QDialog):
         btn_l = QHBoxLayout(btn_row)
         btn_l.setContentsMargins(0, 0, 0, 0)
         btn_l.addStretch()
-        btn_close = QPushButton("关闭")
+        btn_close = QPushButton(self._t("关闭", "Close"))
         btn_close.clicked.connect(self.accept)
         btn_l.addWidget(btn_close)
         root.addWidget(btn_row)
@@ -975,12 +1014,12 @@ class CustomGraphicsView(QGraphicsView):
         except Exception as e:
             # Prevent PySide6 from spamming "Error calling Python override..." on every move.
             try:
-                import time as _t
-                now = _t.time()
+                import time as _time_mod
+                now = _time_mod.time()
                 last = float(getattr(self, "_last_mousemove_err_ts", 0.0) or 0.0)
                 if (now - last) > 1.0:
                     self._last_mousemove_err_ts = now
-                    print(f"mouseMoveEvent 异常: {e}")
+                    logger.warning(f"mouseMoveEvent 异常: {e}")
             except Exception:
                 pass
 
@@ -1077,7 +1116,7 @@ class CanvasTextBox(QGraphicsItemGroup):
         elif isinstance(rect, (tuple, list)) and len(rect) == 4:
             x, y, w, h = rect
         else:
-            print(f"警告: 无效的rect格式: {rect}")
+            logger.warning(f"无效的rect格式: {rect}")
             x, y, w, h = 0, 0, 100, 50
 
         self.box = QGraphicsRectItem(0, 0, w, h)
@@ -1132,7 +1171,7 @@ class CanvasTextBox(QGraphicsItemGroup):
             r = self.box.rect()
             self.model["rect"] = [int(round(p.x())), int(round(p.y())), int(round(r.width())), int(round(r.height()))]
         except Exception as e:
-            print(f"同步文本框位置失败: {e}")
+            logger.warning(f"同步文本框位置失败: {e}")
 
     def _sync_model_bg(self):
         """将当前背景色状态写回 model"""
@@ -1191,7 +1230,7 @@ class CanvasTextBox(QGraphicsItemGroup):
             pt_w = avail_w * sample_pt / w100
             pt_h = avail_h * sample_pt / h100
             pt = min(pt_w, pt_h) * 0.98  # small safety factor
-            return float(max(6.0, min(pt, 200.0)))
+            return float(max(6.0, min(pt, 600.0)))
 
         # 字体/字号/加粗
         family = self.model.get("font_family") or "Microsoft YaHei"
@@ -1201,6 +1240,18 @@ class CanvasTextBox(QGraphicsItemGroup):
             fs = int(fs) if fs is not None else None
         except Exception:
             fs = None
+
+        # Backward compatibility: older builds capped auto-fit at 200pt which makes big titles too small.
+        # If the stored value looks like it hit that cap, re-fit with the higher limit.
+        if fs is not None and 200 <= fs <= 205:
+            try:
+                r = self.box.rect()
+                h_pt_est = float(r.height()) * 72.0 / 96.0
+                if h_pt_est > (float(fs) + 30.0):
+                    fs = None
+                    self.model["font_size"] = None
+            except Exception:
+                pass
         if fs is None:
             # Prefer the same font-fitting logic used by PPT export, so canvas preview matches PPT more closely.
             try:
@@ -1285,7 +1336,7 @@ class CanvasTextBox(QGraphicsItemGroup):
             self.box.update()
             self.update()
         except Exception as e:
-            print(f"更新背景色失败: {e}")
+            logger.warning(f"更新背景色失败: {e}")
             self.box.setBrush(QBrush(QColor(255, 255, 255, 1)))
             self.box.update()
             self.update()
@@ -1390,12 +1441,20 @@ class CanvasTextBox(QGraphicsItemGroup):
 class PPTCloneApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Set a safe default title first; final title is set after UI language is resolved.
         self.setWindowTitle("PowerOCR Presentation")
         self.resize(1200, 760)
         self.setStyleSheet(GLOBAL_STYLE)
 
         self.settings_path = os.path.join(os.path.dirname(__file__), "settings.json")
         self.settings = self.load_settings()
+        # UI language (affects visible labels/buttons; stored in settings.json).
+        self.ui_lang_setting = str(self.settings.get("ui_lang") or "auto").strip()
+        self.ui_lang = self._resolve_ui_lang(self.ui_lang_setting)
+        # Make language available to non-UI helpers/threads in this module.
+        global _UI_LANG
+        _UI_LANG = self.ui_lang
+        self.setWindowTitle(self._t("PowerOCR 演示", "PowerOCR Presentation"))
 
         self.images = []
         self.box_data = {}
@@ -1415,8 +1474,8 @@ class PPTCloneApp(QMainWindow):
         # 注意：OCR 模型缓存（official_models）不是这里，它由 PADDLE_PDX_CACHE_HOME 控制，默认也在项目目录 model/ 下。
         self.run_cache_dir = None
         try:
-            import time as _t
-            run_id = f"run_{int(_t.time() * 1000)}_{os.getpid()}"
+            import time as _time_mod
+            run_id = f"run_{int(_time_mod.time() * 1000)}_{os.getpid()}"
             root = os.path.join(os.path.dirname(__file__), "_runtime_cache")
             self.run_cache_dir = os.path.join(root, run_id)
             os.makedirs(self.run_cache_dir, exist_ok=True)
@@ -1484,12 +1543,136 @@ class PPTCloneApp(QMainWindow):
             webbrowser.open(url)
         except Exception as e:
             try:
-                QMessageBox.warning(self, "提示", f"无法打开浏览器：{e}\n\n{url}")
+                QMessageBox.warning(
+                    self,
+                    self._t("提示", "Info"),
+                    self._t(f"无法打开浏览器：{e}\n\n{url}", f"Failed to open browser: {e}\n\n{url}"),
+                )
             except Exception:
                 pass
 
+    def _resolve_ui_lang(self, pref: str) -> str:
+        """Return effective UI language ("zh" or "en") based on user preference."""
+        p = (pref or "").strip().lower().replace("_", "-")
+        if p in ("zh", "zh-cn", "cn", "chinese"):
+            return "zh"
+        if p in ("en", "en-us", "english"):
+            return "en"
+
+        # auto/system
+        try:
+            loc = (QLocale.system().name() or "").lower()  # e.g. "zh_CN"
+            if loc.startswith("zh"):
+                return "zh"
+        except Exception:
+            pass
+        return "en"
+
+    def _t(self, zh: str, en: str = None) -> str:
+        """Tiny i18n helper: choose between Chinese / English strings."""
+        try:
+            if str(getattr(self, "ui_lang", "zh")).lower().startswith("en"):
+                return en if en is not None else zh
+        except Exception:
+            pass
+        return zh
+
+    def set_ui_lang(self, pref: str):
+        """Persist UI language preference; effective language is resolved immediately."""
+        pref = (pref or "auto").strip()
+        self.settings["ui_lang"] = pref
+        self.ui_lang_setting = pref
+        self.ui_lang = self._resolve_ui_lang(pref)
+        global _UI_LANG
+        _UI_LANG = self.ui_lang
+        self.save_settings()
+
+    def _update_lang_button_styles(self):
+        """更新语言按钮的选中状态样式"""
+        current_lang = getattr(self, "_current_ui_lang", "auto")
+
+        # 选中状态样式（红色背景 + 白色文字）
+        selected_style = f"""
+            QToolButton {{
+                background-color: {PPT_THEME_RED};
+                color: white;
+                border: 2px solid {PPT_THEME_RED};
+                border-radius: 4px;
+                padding-top: 4px;
+                font-size: 11px;
+                font-weight: bold;
+            }}
+            QToolButton:hover {{
+                background-color: #B8381F;
+                border: 2px solid #B8381F;
+            }}
+        """
+
+        # 未选中状态样式（灰色边框 + 黑色文字）
+        unselected_style = """
+            QToolButton {
+                background-color: #F8F8F8;
+                color: #333;
+                border: 2px solid #CCC;
+                border-radius: 4px;
+                padding-top: 4px;
+                font-size: 11px;
+            }
+            QToolButton:hover {
+                background-color: #E8E8E8;
+                border: 2px solid #999;
+            }
+        """
+
+        # 应用样式
+        for btn, lang in [(self.btn_lang_auto, "auto"), (self.btn_lang_zh, "zh"), (self.btn_lang_en, "en")]:
+            if lang == current_lang:
+                btn.setStyleSheet(selected_style)
+            else:
+                btn.setStyleSheet(unselected_style)
+
+    def on_ui_lang_btn_clicked(self, lang_code):
+        """处理语言按钮点击事件"""
+        old = str(self.settings.get("ui_lang") or "auto").strip()
+        if lang_code == old:
+            return
+
+        self.set_ui_lang(lang_code)
+
+        # 更新当前语言并刷新按钮样式
+        self._current_ui_lang = lang_code
+        self._update_lang_button_styles()
+
+        QMessageBox.information(
+            self,
+            self._t("提示", "Info"),
+            self._t("界面语言已保存，重启软件后生效。", "UI language saved. Restart the app to apply."),
+        )
+
+    def on_ui_lang_changed(self, *_):
+        """保留旧的下拉框处理函数以兼容（如果有其他地方调用）"""
+        cb = getattr(self, "combo_ui_lang", None)
+        if cb is None:
+            return
+        pref = cb.currentData() or "auto"
+        old = str(self.settings.get("ui_lang") or "auto").strip()
+        if pref == old:
+            return
+
+        self.set_ui_lang(pref)
+        QMessageBox.information(
+            self,
+            self._t("提示", "Info"),
+            self._t("界面语言已保存，重启软件后生效。", "UI language saved. Restart the app to apply."),
+        )
+
     def load_settings(self) -> dict:
         defaults = {
+            # UI language preference:
+            # - "auto": follow system language (zh -> Chinese UI, otherwise English UI)
+            # - "zh": force Chinese UI
+            # - "en": force English UI
+            "ui_lang": "auto",
             "ocr_use_gpu": False,
             # PaddleOCR 3.x (PaddleX) 的缓存根目录。模型会下载到：<PADDLE_PDX_CACHE_HOME>/official_models/...
             # 建议设置为“某个文件夹/.paddlex”，不要直接指向 official_models。
@@ -1520,7 +1703,7 @@ class PPTCloneApp(QMainWindow):
             with open(self.settings_path, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"保存设置失败: {e}")
+            logger.warning(f"保存设置失败: {e}")
 
     def _apply_ocr_env(self):
         cache_dir = (self.settings.get("ocr_paddlex_home") or "").strip()
@@ -1586,8 +1769,14 @@ class PPTCloneApp(QMainWindow):
             return False
 
         self.ocr_loading = True
-        progress = QProgressDialog("正在初始化 OCR 引擎（首次可能下载模型，请稍候）...", "", 0, 0, self)
-        progress.setWindowTitle("初始化 OCR")
+        progress = QProgressDialog(
+            self._t("正在初始化 OCR 引擎（首次可能下载模型，请稍候）...", "Initializing OCR engine (first run may download models)..."),
+            "",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle(self._t("初始化 OCR", "Initializing OCR"))
         progress.setCancelButton(None)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
@@ -1613,7 +1802,14 @@ class PPTCloneApp(QMainWindow):
             return True
         except Exception as e:
             self.ocr_engine = None
-            QMessageBox.critical(self, "OCR 初始化失败", f"{e}\n\n你可以在【设置】里选择模型缓存目录（PADDLE_PDX_CACHE_HOME）或手动指定 det/rec 模型目录。")
+            QMessageBox.critical(
+                self,
+                self._t("OCR 初始化失败", "OCR init failed"),
+                self._t(
+                    f"{e}\n\n你可以在【设置】里选择模型缓存目录（PADDLE_PDX_CACHE_HOME）或手动指定 det/rec 模型目录。",
+                    f"{e}\n\nYou can set the model cache folder (PADDLE_PDX_CACHE_HOME) or specify det/rec model dirs in Settings.",
+                ),
+            )
             return False
         finally:
             self.ocr_loading = False
@@ -1628,7 +1824,7 @@ class PPTCloneApp(QMainWindow):
         from PySide6.QtWidgets import QDialog, QFormLayout, QLineEdit
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("OCR 设置")
+        dlg.setWindowTitle(self._t("OCR 设置", "OCR Settings"))
         dlg.setModal(True)
         dlg.setMinimumWidth(520)
 
@@ -1637,9 +1833,9 @@ class PPTCloneApp(QMainWindow):
         default_rel_home = "model" if os.path.isdir(os.path.join(os.path.dirname(__file__), "model")) else ".paddlex"
         current_default_home = os.path.join(os.path.dirname(__file__), default_rel_home)
         ed_cache = QLineEdit(str(self.settings.get("ocr_paddlex_home", "") or default_rel_home))
-        btn_cache = QPushButton("选择目录")
-        btn_cache.clicked.connect(lambda: ed_cache.setText(QFileDialog.getExistingDirectory(self, "选择模型缓存目录（PADDLE_PDX_CACHE_HOME）", ed_cache.text() or current_default_home) or ed_cache.text()))
-        btn_use_project = QPushButton("用项目目录")
+        btn_cache = QPushButton(self._t("选择目录", "Browse"))
+        btn_cache.clicked.connect(lambda: ed_cache.setText(QFileDialog.getExistingDirectory(self, self._t("选择模型缓存目录（PADDLE_PDX_CACHE_HOME）", "Select model cache folder (PADDLE_PDX_CACHE_HOME)"), ed_cache.text() or current_default_home) or ed_cache.text()))
+        btn_use_project = QPushButton(self._t("用项目目录", "Use project dir"))
         btn_use_project.clicked.connect(lambda: ed_cache.setText(default_rel_home))
         row_cache = QWidget()
         hl = QHBoxLayout(row_cache)
@@ -1647,39 +1843,45 @@ class PPTCloneApp(QMainWindow):
         hl.addWidget(ed_cache)
         hl.addWidget(btn_cache)
         hl.addWidget(btn_use_project)
-        form.addRow("模型缓存目录（PADDLE_PDX_CACHE_HOME，会生成 official_models）", row_cache)
+        form.addRow(self._t("模型缓存目录（PADDLE_PDX_CACHE_HOME，会生成 official_models）", "Model cache dir (PADDLE_PDX_CACHE_HOME; will create official_models/)"), row_cache)
 
         ed_det = QLineEdit(str(self.settings.get("ocr_det_dir", "")))
-        btn_det = QPushButton("选择目录")
-        btn_det.clicked.connect(lambda: ed_det.setText(QFileDialog.getExistingDirectory(self, "选择检测模型目录(det)", ed_det.text() or os.getcwd()) or ed_det.text()))
+        btn_det = QPushButton(self._t("选择目录", "Browse"))
+        btn_det.clicked.connect(lambda: ed_det.setText(QFileDialog.getExistingDirectory(self, self._t("选择检测模型目录(det)", "Select detection model dir (det)"), ed_det.text() or os.getcwd()) or ed_det.text()))
         row_det = QWidget()
         hl = QHBoxLayout(row_det)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.addWidget(ed_det)
         hl.addWidget(btn_det)
-        form.addRow("检测模型目录（可选）", row_det)
+        form.addRow(self._t("检测模型目录（可选）", "Detection model dir (optional)"), row_det)
 
         ed_rec = QLineEdit(str(self.settings.get("ocr_rec_dir", "")))
-        btn_rec = QPushButton("选择目录")
-        btn_rec.clicked.connect(lambda: ed_rec.setText(QFileDialog.getExistingDirectory(self, "选择识别模型目录(rec)", ed_rec.text() or os.getcwd()) or ed_rec.text()))
+        btn_rec = QPushButton(self._t("选择目录", "Browse"))
+        btn_rec.clicked.connect(lambda: ed_rec.setText(QFileDialog.getExistingDirectory(self, self._t("选择识别模型目录(rec)", "Select recognition model dir (rec)"), ed_rec.text() or os.getcwd()) or ed_rec.text()))
         row_rec = QWidget()
         hl = QHBoxLayout(row_rec)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.addWidget(ed_rec)
         hl.addWidget(btn_rec)
-        form.addRow("识别模型目录（可选）", row_rec)
+        form.addRow(self._t("识别模型目录（可选）", "Recognition model dir (optional)"), row_rec)
 
-        chk_gpu = QCheckBox("使用 GPU（若不可用会自动回退 CPU）")
+        chk_gpu = QCheckBox(self._t("使用 GPU（若不可用会自动回退 CPU）", "Use GPU (auto fallback to CPU)"))
         chk_gpu.setChecked(bool(self.settings.get("ocr_use_gpu", False)))
-        form.addRow("设备", chk_gpu)
+        form.addRow(self._t("设备", "Device"), chk_gpu)
 
-        chk_redownload = QCheckBox("清空目标目录的 official_models（强制重新下载）")
+        chk_redownload = QCheckBox(self._t("清空目标目录的 official_models（强制重新下载）", "Delete official_models (force re-download)"))
         chk_redownload.setChecked(False)
         form.addRow("", chk_redownload)
 
-        tips = QLabel("说明：程序启动不再初始化模型；首次点【OCR识别】时才会加载。\n"
-                      "PaddleOCR 3.x 会把模型下载到：<PADDLE_PDX_CACHE_HOME>/official_models。\n"
-                      "不要把缓存目录直接指向 official_models。")
+        tips = QLabel(self._t(
+            "说明：程序启动不再初始化模型；首次点【OCR识别】时才会加载。\n"
+            "PaddleOCR 3.x 会把模型下载到：<PADDLE_PDX_CACHE_HOME>/official_models。\n"
+            "不要把缓存目录直接指向 official_models。",
+            "Notes:\n"
+            "- OCR engine is loaded lazily (first OCR run).\n"
+            "- PaddleOCR 3.x downloads models to: <PADDLE_PDX_CACHE_HOME>/official_models.\n"
+            "- Do NOT set the cache folder to official_models directly.",
+        ))
         tips.setStyleSheet("color:#555;")
         form.addRow("", tips)
 
@@ -1687,9 +1889,9 @@ class PPTCloneApp(QMainWindow):
         hl2 = QHBoxLayout(btn_row)
         hl2.setContentsMargins(0, 0, 0, 0)
         hl2.addStretch()
-        btn_reload = QPushButton("保存并重新加载OCR")
-        btn_ok = QPushButton("保存")
-        btn_cancel = QPushButton("取消")
+        btn_reload = QPushButton(self._t("保存并重新加载OCR", "Save & Reload"))
+        btn_ok = QPushButton(self._t("保存", "Save"))
+        btn_cancel = QPushButton(self._t("取消", "Cancel"))
         hl2.addWidget(btn_reload)
         hl2.addWidget(btn_ok)
         hl2.addWidget(btn_cancel)
@@ -1731,45 +1933,45 @@ class PPTCloneApp(QMainWindow):
 
     def open_inpaint_settings(self, *args):
         """Settings dialog for IOPaint API used to remove non-editable text in the background."""
-        from PySide6.QtWidgets import QDialog, QFormLayout, QPlainTextEdit, QSpinBox
+        from PySide6.QtWidgets import QDialog, QFormLayout, QLineEdit, QSpinBox
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("IOPaint 设置")
+        dlg.setWindowTitle(self._t("IOPaint 设置", "IOPaint Settings"))
         dlg.setModal(True)
         dlg.setMinimumWidth(520)
 
         form = QFormLayout(dlg)
 
-        chk_enabled = QCheckBox("启用 IOPaint 去字（导出前可生成纯背景底图）")
+        chk_enabled = QCheckBox(self._t("启用 IOPaint 去字（导出前可生成纯背景底图）", "Enable IOPaint clean background (before export)"))
         chk_enabled.setChecked(bool(self.settings.get("inpaint_enabled", True)))
-        form.addRow("开关", chk_enabled)
+        form.addRow(self._t("开关", "Enable"), chk_enabled)
 
-        cur_urls = parse_inpaint_api_urls(self.settings.get("inpaint_api_url", ""))
-        if not cur_urls:
-            cur_urls = ["http://127.0.0.1:8080/api/v1/inpaint"]
-        ed_url = QPlainTextEdit("\n".join(cur_urls))
-        ed_url.setPlaceholderText("http://127.0.0.1:8080/api/v1/inpaint\nhttp://127.0.0.1:8081/api/v1/inpaint")
-        ed_url.setFixedHeight(80)
-        form.addRow("IOPaint API 地址（可多行）", ed_url)
+        ed_url = QLineEdit(str(self.settings.get("inpaint_api_url", "") or "http://127.0.0.1:8080/api/v1/inpaint"))
+        form.addRow(self._t("IOPaint API 地址", "IOPaint API URL"), ed_url)
 
         sp_box_pad = QSpinBox()
         sp_box_pad.setRange(0, 200)
         sp_box_pad.setValue(int(self.settings.get("inpaint_box_padding", 6) or 6))
         sp_box_pad.setSuffix(" px")
-        form.addRow("文本框外扩（遮罩）", sp_box_pad)
+        form.addRow(self._t("文本框外扩（遮罩）", "Box padding (mask)"), sp_box_pad)
 
         sp_crop_pad = QSpinBox()
         sp_crop_pad.setRange(0, 2000)
         sp_crop_pad.setValue(int(self.settings.get("inpaint_crop_padding", 128) or 128))
         sp_crop_pad.setSuffix(" px")
-        form.addRow("裁剪外扩（API加速）", sp_crop_pad)
+        form.addRow(self._t("裁剪外扩（API加速）", "Crop padding (API speed-up)"), sp_crop_pad)
 
-        tips = QLabel(
+        tips = QLabel(self._t(
             "说明：会根据 OCR 文本框生成遮罩（略外扩），调用 IOPaint API 修复得到纯背景。\n"
-            "支持多地址：每行一个 URL；程序会把文本框均分到各地址并发请求。\n"
+            "支持多个 API 地址：用分号/逗号分隔（例如：url1;url2），可并行加速。\n"
             "建议先在命令行启动服务：\n"
-            "  iopaint start --host 127.0.0.1 --port 8080\n"
-        )
+            "  iopaint start --host 127.0.0.1 --port 8080\n",
+            "Notes:\n"
+            "- A mask is built from OCR boxes (with padding), then sent to IOPaint API.\n"
+            "- Multiple endpoints are supported: separate with ';' or ',' (e.g. url1;url2) for parallel speed-up.\n"
+            "- Start the service first:\n"
+            "  iopaint start --host 127.0.0.1 --port 8080\n",
+        ))
         tips.setStyleSheet("color:#555;")
         form.addRow("", tips)
 
@@ -1777,16 +1979,15 @@ class PPTCloneApp(QMainWindow):
         hl2 = QHBoxLayout(btn_row)
         hl2.setContentsMargins(0, 0, 0, 0)
         hl2.addStretch()
-        btn_ok = QPushButton("保存")
-        btn_cancel = QPushButton("取消")
+        btn_ok = QPushButton(self._t("保存", "Save"))
+        btn_cancel = QPushButton(self._t("取消", "Cancel"))
         hl2.addWidget(btn_ok)
         hl2.addWidget(btn_cancel)
         form.addRow("", btn_row)
 
         def save_and_close():
             self.settings["inpaint_enabled"] = chk_enabled.isChecked()
-            urls = parse_inpaint_api_urls(ed_url.toPlainText())
-            self.settings["inpaint_api_url"] = "\n".join(urls)
+            self.settings["inpaint_api_url"] = (ed_url.text() or "").strip()
             self.settings["inpaint_box_padding"] = int(sp_box_pad.value())
             self.settings["inpaint_crop_padding"] = int(sp_crop_pad.value())
             self.save_settings()
@@ -1931,7 +2132,14 @@ class PPTCloneApp(QMainWindow):
         if enabled and (not self._has_any_inpaint_variant()):
             # No variants yet: don't enter a confusing "checked but unchanged" state.
             try:
-                QMessageBox.information(self, "提示", "还没有生成“去字底图”。\n请先点击【去字-本页/全部】。")
+                QMessageBox.information(
+                    self,
+                    self._t("提示", "Info"),
+                    self._t(
+                        "还没有生成“去字底图”。\n请先点击【去字-本页/全部】。",
+                        'No "clean background" has been generated yet.\nPlease run Clean (Current/All) first.',
+                    ),
+                )
             except Exception:
                 pass
             enabled = False
@@ -1959,7 +2167,11 @@ class PPTCloneApp(QMainWindow):
         cur = str(self.current_img)
         if not (isinstance(m, dict) and cur in m and m.get(cur)):
             try:
-                QMessageBox.information(self, "提示", "当前页没有“去字底图”。")
+                QMessageBox.information(
+                    self,
+                    self._t("提示", "Info"),
+                    self._t("当前页没有“去字底图”。", 'No "clean background" for the current slide.'),
+                )
             except Exception:
                 pass
             return
@@ -2040,164 +2252,164 @@ class PPTCloneApp(QMainWindow):
         except Exception:
             pass
 
-        self.act_undo = QAction("撤销", self)
+        self.act_undo = QAction(self._t("撤销", "Undo"), self)
         self.act_undo.setShortcut(QKeySequence.Undo)
         self.act_undo.triggered.connect(self.undo)
         self.addAction(self.act_undo)
 
-        self.act_redo = QAction("重做", self)
+        self.act_redo = QAction(self._t("重做", "Redo"), self)
         self.act_redo.setShortcut(QKeySequence.Redo)
         self.act_redo.triggered.connect(self.redo)
         self.addAction(self.act_redo)
 
-        self.act_cut = QAction("剪切", self)
+        self.act_cut = QAction(self._t("剪切", "Cut"), self)
         self.act_cut.setShortcut(QKeySequence.Cut)
         self.act_cut.triggered.connect(self.cut_selected_box)
         self.addAction(self.act_cut)
 
-        self.act_copy = QAction("复制", self)
+        self.act_copy = QAction(self._t("复制", "Copy"), self)
         self.act_copy.setShortcut(QKeySequence.Copy)
         self.act_copy.triggered.connect(self.copy_selected_box)
         self.addAction(self.act_copy)
 
-        self.act_paste = QAction("粘贴", self)
+        self.act_paste = QAction(self._t("粘贴", "Paste"), self)
         self.act_paste.setShortcut(QKeySequence.Paste)
         self.act_paste.triggered.connect(self.paste_box)
         self.addAction(self.act_paste)
 
-        self.act_paste_image = QAction("粘贴图片", self)
+        self.act_paste_image = QAction(self._t("粘贴图片", "Paste Image"), self)
         self.act_paste_image.setShortcut(QKeySequence("Ctrl+Shift+V"))
         self.act_paste_image.triggered.connect(self.paste_clipboard_image)
         self.addAction(self.act_paste_image)
 
-        self.act_del_box = QAction("删除文本框", self)
+        self.act_del_box = QAction(self._t("删除文本框", "Delete Text Box"), self)
         self.act_del_box.setShortcut(QKeySequence.Delete)
         self.act_del_box.triggered.connect(self.delete_box)
         self.addAction(self.act_del_box)
 
         # Extra shortcuts (PowerPoint-like workflow)
-        self.act_import_images = QAction("导入图片", self)
+        self.act_import_images = QAction(self._t("导入图片", "Import Images"), self)
         self.act_import_images.setShortcut(QKeySequence("Ctrl+O"))
         self.act_import_images.triggered.connect(self.import_images)
         self.addAction(self.act_import_images)
 
-        self.act_import_pdfs = QAction("导入PDF", self)
+        self.act_import_pdfs = QAction(self._t("导入PDF", "Import PDF"), self)
         self.act_import_pdfs.setShortcut(QKeySequence("Ctrl+Shift+O"))
         self.act_import_pdfs.triggered.connect(self.import_pdfs)
         self.addAction(self.act_import_pdfs)
 
-        self.act_export_ppt = QAction("导出PPT", self)
+        self.act_export_ppt = QAction(self._t("导出PPT", "Export PPT"), self)
         self.act_export_ppt.setShortcut(QKeySequence("Ctrl+S"))
         self.act_export_ppt.triggered.connect(self.export_ppt)
         self.addAction(self.act_export_ppt)
 
-        self.act_preview_ppt = QAction("预览PPT", self)
+        self.act_preview_ppt = QAction(self._t("预览PPT", "Preview PPT"), self)
         self.act_preview_ppt.setShortcut(QKeySequence("F5"))
         self.act_preview_ppt.triggered.connect(self.preview_ppt)
         self.addAction(self.act_preview_ppt)
 
-        self.act_ocr_current = QAction("OCR本页", self)
+        self.act_ocr_current = QAction(self._t("OCR本页", "OCR Current"), self)
         self.act_ocr_current.setShortcuts([QKeySequence("Ctrl+Return"), QKeySequence("Ctrl+Enter")])
         self.act_ocr_current.triggered.connect(self.run_ocr_current_slide)
         self.addAction(self.act_ocr_current)
 
-        self.act_ocr_all = QAction("OCR全部", self)
+        self.act_ocr_all = QAction(self._t("OCR全部", "OCR All"), self)
         self.act_ocr_all.setShortcut(QKeySequence("Ctrl+R"))
         self.act_ocr_all.triggered.connect(self.run_ocr_all_images)
         self.addAction(self.act_ocr_all)
 
-        self.act_inpaint_current = QAction("IOPaint去字本页", self)
+        self.act_inpaint_current = QAction(self._t("IOPaint去字本页", "IOPaint Clean (Current)"), self)
         self.act_inpaint_current.setShortcut(QKeySequence("Ctrl+I"))
         self.act_inpaint_current.triggered.connect(self.inpaint_current_slide)
         self.addAction(self.act_inpaint_current)
 
-        self.act_inpaint_all = QAction("IOPaint去字全部", self)
+        self.act_inpaint_all = QAction(self._t("IOPaint去字全部", "IOPaint Clean (All)"), self)
         self.act_inpaint_all.setShortcut(QKeySequence("Ctrl+Shift+I"))
         self.act_inpaint_all.triggered.connect(self.inpaint_all_slides)
         self.addAction(self.act_inpaint_all)
 
         # Inpaint compare / ROI tools
-        self.act_toggle_inpaint_preview = QAction("切换去字预览（原图/去字）", self)
+        self.act_toggle_inpaint_preview = QAction(self._t("切换去字预览（原图/去字）", "Toggle Clean Preview (Orig/Clean)"), self)
         self.act_toggle_inpaint_preview.setShortcut(QKeySequence("Ctrl+Alt+B"))
         self.act_toggle_inpaint_preview.triggered.connect(self.toggle_inpaint_preview)
         self.addAction(self.act_toggle_inpaint_preview)
 
-        self.act_clear_inpaint_current = QAction("恢复原图（清除本页去字图）", self)
+        self.act_clear_inpaint_current = QAction(self._t("恢复原图（清除本页去字图）", "Restore Original (Clear Clean BG)"), self)
         self.act_clear_inpaint_current.setShortcut(QKeySequence("Ctrl+Alt+Shift+B"))
         self.act_clear_inpaint_current.triggered.connect(self.clear_inpaint_variant_current)
         self.addAction(self.act_clear_inpaint_current)
 
-        self.act_roi_select = QAction("框选选区（OCR/去字）", self)
+        self.act_roi_select = QAction(self._t("框选选区（OCR/去字）", "Select ROI (OCR/Clean)"), self)
         self.act_roi_select.setShortcut(QKeySequence("Ctrl+Alt+A"))
         self.act_roi_select.triggered.connect(self.toggle_roi_select_mode)
         self.addAction(self.act_roi_select)
 
-        self.act_roi_clear = QAction("清除选区", self)
+        self.act_roi_clear = QAction(self._t("清除选区", "Clear ROI"), self)
         self.act_roi_clear.setShortcut(QKeySequence("Ctrl+Alt+Shift+A"))
         self.act_roi_clear.triggered.connect(self.clear_roi_current)
         self.addAction(self.act_roi_clear)
 
-        self.act_new_slide = QAction("新建空白页", self)
+        self.act_new_slide = QAction(self._t("新建空白页", "New Blank Slide"), self)
         self.act_new_slide.setShortcut(QKeySequence("Ctrl+N"))
         self.act_new_slide.triggered.connect(self.new_blank_slide)
         self.addAction(self.act_new_slide)
 
-        self.act_dup_slide = QAction("复制当前页", self)
+        self.act_dup_slide = QAction(self._t("复制当前页", "Duplicate Slide"), self)
         self.act_dup_slide.setShortcut(QKeySequence("Ctrl+D"))
         self.act_dup_slide.triggered.connect(self.duplicate_slide)
         self.addAction(self.act_dup_slide)
 
-        self.act_del_slide = QAction("删除当前页", self)
+        self.act_del_slide = QAction(self._t("删除当前页", "Delete Slide"), self)
         self.act_del_slide.setShortcut(QKeySequence("Ctrl+Shift+Delete"))
         self.act_del_slide.triggered.connect(self.delete_slide)
         self.addAction(self.act_del_slide)
 
-        self.act_move_slide_up = QAction("上移当前页", self)
+        self.act_move_slide_up = QAction(self._t("上移当前页", "Move Slide Up"), self)
         self.act_move_slide_up.setShortcut(QKeySequence("Alt+Up"))
         self.act_move_slide_up.triggered.connect(self.move_slide_up)
         self.addAction(self.act_move_slide_up)
 
-        self.act_move_slide_down = QAction("下移当前页", self)
+        self.act_move_slide_down = QAction(self._t("下移当前页", "Move Slide Down"), self)
         self.act_move_slide_down.setShortcut(QKeySequence("Alt+Down"))
         self.act_move_slide_down.triggered.connect(self.move_slide_down)
         self.addAction(self.act_move_slide_down)
 
-        self.act_prev_slide = QAction("上一页", self)
+        self.act_prev_slide = QAction(self._t("上一页", "Previous Slide"), self)
         self.act_prev_slide.setShortcuts([QKeySequence("PageUp"), QKeySequence("Alt+Left")])
         self.act_prev_slide.triggered.connect(self.goto_prev_slide)
         self.addAction(self.act_prev_slide)
 
-        self.act_next_slide = QAction("下一页", self)
+        self.act_next_slide = QAction(self._t("下一页", "Next Slide"), self)
         self.act_next_slide.setShortcuts([QKeySequence("PageDown"), QKeySequence("Alt+Right")])
         self.act_next_slide.triggered.connect(self.goto_next_slide)
         self.addAction(self.act_next_slide)
 
-        self.act_fit_view = QAction("适应窗口", self)
+        self.act_fit_view = QAction(self._t("适应窗口", "Fit to Window"), self)
         self.act_fit_view.setShortcut(QKeySequence("Ctrl+0"))
         self.act_fit_view.triggered.connect(self.fit_view_to_window)
         self.addAction(self.act_fit_view)
 
-        self.act_zoom_in = QAction("放大", self)
+        self.act_zoom_in = QAction(self._t("放大", "Zoom In"), self)
         self.act_zoom_in.setShortcut(QKeySequence.ZoomIn)
         self.act_zoom_in.triggered.connect(self.zoom_in)
         self.addAction(self.act_zoom_in)
 
-        self.act_zoom_out = QAction("缩小", self)
+        self.act_zoom_out = QAction(self._t("缩小", "Zoom Out"), self)
         self.act_zoom_out.setShortcut(QKeySequence.ZoomOut)
         self.act_zoom_out.triggered.connect(self.zoom_out)
         self.addAction(self.act_zoom_out)
 
-        self.act_toggle_left_panel = QAction("显示/隐藏缩略图", self)
+        self.act_toggle_left_panel = QAction(self._t("显示/隐藏缩略图", "Toggle Thumbnails"), self)
         self.act_toggle_left_panel.setShortcut(QKeySequence("Ctrl+Alt+L"))
         self.act_toggle_left_panel.triggered.connect(self.toggle_left_panel)
         self.addAction(self.act_toggle_left_panel)
 
-        self.act_toggle_right_panel = QAction("显示/隐藏右侧面板", self)
+        self.act_toggle_right_panel = QAction(self._t("显示/隐藏右侧面板", "Toggle Right Panel"), self)
         self.act_toggle_right_panel.setShortcut(QKeySequence("Ctrl+Alt+R"))
         self.act_toggle_right_panel.triggered.connect(self.toggle_right_panel)
         self.addAction(self.act_toggle_right_panel)
 
-        self.act_show_shortcuts = QAction("快捷键", self)
+        self.act_show_shortcuts = QAction(self._t("快捷键", "Shortcuts"), self)
         self.act_show_shortcuts.setShortcut(QKeySequence("F1"))
         self.act_show_shortcuts.triggered.connect(self.show_shortcuts)
         self.addAction(self.act_show_shortcuts)
@@ -2227,7 +2439,7 @@ class PPTCloneApp(QMainWindow):
             cl.addWidget(btn_gh)
 
             # Show a short label; keep full URL in tooltip (and in the actual link target).
-            lb_gh = QLabel(f'<a href="{url}">开源地址</a>')
+            lb_gh = QLabel(f'<a href="{url}">{self._t("开源地址", "GitHub")}</a>')
             lb_gh.setOpenExternalLinks(True)
             lb_gh.setToolTip(url)
             lb_gh.setStyleSheet("font-size: 12px; color: #0b57d0;")
@@ -2243,25 +2455,25 @@ class PPTCloneApp(QMainWindow):
         lay_home.setSpacing(2) # 组与分割线之间的间距
         
         # --- Group 1: 剪贴板 ---
-        grp_clip = RibbonGroup("剪贴板")
-        btn_paste = RibbonLargeBtn("粘贴", "fa5s.paste")
+        grp_clip = RibbonGroup(self._t("剪贴板", "Clipboard"))
+        btn_paste = RibbonLargeBtn(self._t("粘贴", "Paste"), "fa5s.paste")
         btn_paste.clicked.connect(self.paste_box)
         w_small = QWidget()
         l_small = QVBoxLayout(w_small)
         l_small.setContentsMargins(0, 4, 0, 0); l_small.setSpacing(0)
-        btn_cut = RibbonSmallBtn("剪切", "fa5s.cut")
+        btn_cut = RibbonSmallBtn(self._t("剪切", "Cut"), "fa5s.cut")
         btn_cut.clicked.connect(self.cut_selected_box)
         l_small.addWidget(btn_cut)
 
-        btn_copy = RibbonSmallBtn("复制", "fa5s.copy")
+        btn_copy = RibbonSmallBtn(self._t("复制", "Copy"), "fa5s.copy")
         btn_copy.clicked.connect(self.copy_selected_box)
         l_small.addWidget(btn_copy)
 
-        btn_brush = RibbonSmallBtn("格式刷", "fa5s.paint-brush")
+        btn_brush = RibbonSmallBtn(self._t("格式刷", "Brush"), "fa5s.paint-brush")
         btn_brush.clicked.connect(self.activate_format_brush)
         l_small.addWidget(btn_brush)
 
-        btn_paste_img = RibbonSmallBtn("粘贴图", "fa5s.image")
+        btn_paste_img = RibbonSmallBtn(self._t("粘贴图", "Paste Img"), "fa5s.image")
         btn_paste_img.clicked.connect(self.paste_clipboard_image)
         l_small.addWidget(btn_paste_img)
 
@@ -2275,24 +2487,24 @@ class PPTCloneApp(QMainWindow):
         lay_home.addWidget(RibbonSeparator())
         
         # --- Group 2: 幻灯片 ---
-        grp_layer = RibbonGroup("幻灯片")
-        btn_layer = RibbonLargeBtn("新建空白\n图层", "fa5s.plus-square")
+        grp_layer = RibbonGroup(self._t("幻灯片", "Slides"))
+        btn_layer = RibbonLargeBtn(self._t("新建空白\n图层", "New Blank\nSlide"), "fa5s.plus-square")
         btn_layer.clicked.connect(self.new_blank_slide)
 
         w_slide_ops = QWidget()
         l_ops = QVBoxLayout(w_slide_ops)
         l_ops.setContentsMargins(0, 4, 0, 0)
         l_ops.setSpacing(0)
-        btn_dup_slide = RibbonSmallBtn("复制页", "fa5s.clone")
+        btn_dup_slide = RibbonSmallBtn(self._t("复制页", "Clone"), "fa5s.clone")
         btn_dup_slide.clicked.connect(self.duplicate_slide)
         l_ops.addWidget(btn_dup_slide)
-        btn_del_slide = RibbonSmallBtn("删除页", "fa5s.trash-alt")
+        btn_del_slide = RibbonSmallBtn(self._t("删除页", "Delete"), "fa5s.trash-alt")
         btn_del_slide.clicked.connect(self.delete_slide)
         l_ops.addWidget(btn_del_slide)
-        btn_up = RibbonSmallBtn("上移", "fa5s.arrow-up")
+        btn_up = RibbonSmallBtn(self._t("上移", "Up"), "fa5s.arrow-up")
         btn_up.clicked.connect(self.move_slide_up)
         l_ops.addWidget(btn_up)
-        btn_down = RibbonSmallBtn("下移", "fa5s.arrow-down")
+        btn_down = RibbonSmallBtn(self._t("下移", "Down"), "fa5s.arrow-down")
         btn_down.clicked.connect(self.move_slide_down)
         l_ops.addWidget(btn_down)
         l_ops.addStretch()
@@ -2305,16 +2517,16 @@ class PPTCloneApp(QMainWindow):
         lay_home.addWidget(RibbonSeparator())
 
         # --- Group 3: 插入 ---
-        grp_insert = RibbonGroup("插入")
-        btn_import = RibbonLargeBtn("导入\n图片", "fa5s.image")
+        grp_insert = RibbonGroup(self._t("插入", "Insert"))
+        btn_import = RibbonLargeBtn(self._t("导入\n图片", "Import\nImage"), "fa5s.image")
         btn_import.clicked.connect(self.import_images)
         grp_insert.add_widget(btn_import)
 
-        btn_import_pdf = RibbonLargeBtn("导入\nPDF", "fa5s.file-pdf")
+        btn_import_pdf = RibbonLargeBtn(self._t("导入\nPDF", "Import\nPDF"), "fa5s.file-pdf")
         btn_import_pdf.clicked.connect(self.import_pdfs)
         grp_insert.add_widget(btn_import_pdf)
         
-        btn_text = RibbonLargeBtn("文本框", "fa5s.font")
+        btn_text = RibbonLargeBtn(self._t("文本框", "Text\nBox"), "fa5s.font")
         btn_text.clicked.connect(self.insert_text_box)
         grp_insert.add_widget(btn_text)
         lay_home.addWidget(grp_insert)
@@ -2323,14 +2535,14 @@ class PPTCloneApp(QMainWindow):
         lay_home.addWidget(RibbonSeparator())
         
         # --- Group 4: 识别与导出 ---
-        grp_ai = RibbonGroup("识别与导出")
-        self.btn_ocr_current = RibbonLargeBtn("OCR\n本页", "fa5s.eye", color=PPT_THEME_RED)
+        grp_ai = RibbonGroup(self._t("识别与导出", "OCR/Export"))
+        self.btn_ocr_current = RibbonLargeBtn(self._t("OCR\n本页", "OCR\nCurrent"), "fa5s.eye", color=PPT_THEME_RED)
         self.btn_ocr_current.clicked.connect(self.run_ocr_current_slide)
 
-        self.btn_ocr_all = RibbonLargeBtn("OCR\n全部", "fa5s.eye", color=PPT_THEME_RED)
+        self.btn_ocr_all = RibbonLargeBtn(self._t("OCR\n全部", "OCR\nAll"), "fa5s.eye", color=PPT_THEME_RED)
         self.btn_ocr_all.clicked.connect(self.run_ocr_all_images)
         
-        self.btn_export = RibbonLargeBtn("导出\nPPT", "fa5s.file-powerpoint", color=PPT_THEME_RED)
+        self.btn_export = RibbonLargeBtn(self._t("导出\nPPT", "Export\nPPT"), "fa5s.file-powerpoint", color=PPT_THEME_RED)
         self.btn_export.clicked.connect(self.export_ppt)
         
         grp_ai.add_widget(self.btn_ocr_current)
@@ -2341,9 +2553,9 @@ class PPTCloneApp(QMainWindow):
         lay_home.addWidget(RibbonSeparator())
 
         # --- Group: 选区（ROI：框选 OCR/去字 区域） ---
-        grp_roi = RibbonGroup("选区")
-        self.btn_roi_select = RibbonLargeBtn("框选\n选区", "fa5s.vector-square", color=PPT_THEME_RED)
-        self.btn_roi_select.setToolTip("拖拽框选 OCR/IOPaint 生效区域 (Ctrl+Alt+A)")
+        grp_roi = RibbonGroup(self._t("选区", "ROI"))
+        self.btn_roi_select = RibbonLargeBtn(self._t("框选\n选区", "Select\nROI"), "fa5s.vector-square", color=PPT_THEME_RED)
+        self.btn_roi_select.setToolTip(self._t("拖拽框选 OCR/IOPaint 生效区域 (Ctrl+Alt+A)", "Drag to select ROI for OCR/IOPaint (Ctrl+Alt+A)"))
         self.btn_roi_select.setCheckable(True)
         # Use full selectors; mixing bare declarations + selectors is easy to break QSS parsing.
         self.btn_roi_select.setStyleSheet(
@@ -2352,8 +2564,8 @@ class PPTCloneApp(QMainWindow):
         )
         self.btn_roi_select.toggled.connect(self.set_roi_select_mode)
 
-        btn_roi_clear = RibbonLargeBtn("清除\n选区", "fa5s.times", color=PPT_THEME_RED)
-        btn_roi_clear.setToolTip("清除当前页选区 (Ctrl+Alt+Shift+A)")
+        btn_roi_clear = RibbonLargeBtn(self._t("清除\n选区", "Clear\nROI"), "fa5s.times", color=PPT_THEME_RED)
+        btn_roi_clear.setToolTip(self._t("清除当前页选区 (Ctrl+Alt+Shift+A)", "Clear ROI (Ctrl+Alt+Shift+A)"))
         btn_roi_clear.clicked.connect(self.clear_roi_current)
 
         grp_roi.add_widget(self.btn_roi_select)
@@ -2363,14 +2575,14 @@ class PPTCloneApp(QMainWindow):
         lay_home.addWidget(RibbonSeparator())
 
         # --- Group: IOPaint 去字（生成纯背景底图） ---
-        grp_inpaint = RibbonGroup("IOPaint去字")
-        btn_inpaint_cur = RibbonLargeBtn("去字\n本页", "fa5s.eraser", color=PPT_THEME_RED)
+        grp_inpaint = RibbonGroup(self._t("IOPaint去字", "IOPaint"))
+        btn_inpaint_cur = RibbonLargeBtn(self._t("去字\n本页", "Clean\nCurrent"), "fa5s.eraser", color=PPT_THEME_RED)
         btn_inpaint_cur.clicked.connect(self.inpaint_current_slide)
-        btn_inpaint_all = RibbonLargeBtn("去字\n全部", "fa5s.eraser", color=PPT_THEME_RED)
+        btn_inpaint_all = RibbonLargeBtn(self._t("去字\n全部", "Clean\nAll"), "fa5s.eraser", color=PPT_THEME_RED)
         btn_inpaint_all.clicked.connect(self.inpaint_all_slides)
 
-        self.btn_inpaint_preview = RibbonLargeBtn("去字\n预览", "fa5s.adjust", color=PPT_THEME_RED)
-        self.btn_inpaint_preview.setToolTip("勾选：显示去字底图；取消：显示原图（便于对比） (Ctrl+Alt+B)")
+        self.btn_inpaint_preview = RibbonLargeBtn(self._t("去字\n预览", "Preview\nClean"), "fa5s.adjust", color=PPT_THEME_RED)
+        self.btn_inpaint_preview.setToolTip(self._t("勾选：显示去字底图；取消：显示原图（便于对比） (Ctrl+Alt+B)", "Checked: show cleaned background; unchecked: original (Ctrl+Alt+B)"))
         self.btn_inpaint_preview.setCheckable(True)
         self.btn_inpaint_preview.setStyleSheet(
             "QToolButton { font-size: 11px; padding-top: 4px; }"
@@ -2378,8 +2590,8 @@ class PPTCloneApp(QMainWindow):
         )
         self.btn_inpaint_preview.toggled.connect(self.set_inpaint_preview)
 
-        btn_inpaint_restore = RibbonLargeBtn("恢复\n原图", "fa5s.history", color=PPT_THEME_RED)
-        btn_inpaint_restore.setToolTip("清除本页去字底图（恢复原图） (Ctrl+Alt+Shift+B)")
+        btn_inpaint_restore = RibbonLargeBtn(self._t("恢复\n原图", "Restore\nOrig"), "fa5s.history", color=PPT_THEME_RED)
+        btn_inpaint_restore.setToolTip(self._t("清除本页去字底图（恢复原图） (Ctrl+Alt+Shift+B)", "Clear cleaned background for this slide (Ctrl+Alt+Shift+B)"))
         btn_inpaint_restore.clicked.connect(self.clear_inpaint_variant_current)
 
         grp_inpaint.add_widget(btn_inpaint_cur)
@@ -2393,7 +2605,7 @@ class PPTCloneApp(QMainWindow):
         
         lay_home.addStretch() # 向左对齐
 
-        self.tabs.addTab(tab_home, "开始")
+        self.tabs.addTab(tab_home, self._t("开始", "Home"))
 
         # --- 视图标签页 ---
         tab_view = QWidget()
@@ -2402,7 +2614,7 @@ class PPTCloneApp(QMainWindow):
         lay_view.setSpacing(2)
 
         # --- Group: PPT导出设置 ---
-        grp_ppt_settings = RibbonGroup("PPT导出设置")
+        grp_ppt_settings = RibbonGroup(self._t("PPT导出设置", "PPT Export"))
 
         # 创建垂直布局容器（紧凑布局，避免 Tab 高度 135 被撑爆）
         settings_container = QWidget()
@@ -2424,7 +2636,7 @@ class PPTCloneApp(QMainWindow):
         row1_l.setContentsMargins(0, 0, 0, 0)
         row1_l.setSpacing(6)
 
-        self.chk_text_bg = QCheckBox("启用文本框背景色")
+        self.chk_text_bg = QCheckBox(self._t("启用文本框背景色", "Text box background"))
         self.chk_text_bg.setStyleSheet("""
             QCheckBox { font-size: 13px; padding: 0px; }
             QCheckBox::indicator { width: 16px; height: 16px; }
@@ -2446,7 +2658,7 @@ class PPTCloneApp(QMainWindow):
         row2_l.addWidget(self.color_preview)
         self.update_color_preview()
 
-        btn_color_picker = QPushButton("颜色")
+        btn_color_picker = QPushButton(self._t("颜色", "Color"))
         btn_color_picker.setIcon(qta.icon("fa5s.palette", color="#666"))
         btn_color_picker.setFixedHeight(20)
         btn_color_picker.setStyleSheet("""
@@ -2456,7 +2668,7 @@ class PPTCloneApp(QMainWindow):
         btn_color_picker.clicked.connect(self.pick_color)
         row2_l.addWidget(btn_color_picker)
 
-        self.btn_eyedropper = QPushButton("吸管")
+        self.btn_eyedropper = QPushButton(self._t("吸管", "Pick"))
         self.btn_eyedropper.setIcon(qta.icon("fa5s.eye-dropper", color="#666"))
         self.btn_eyedropper.setFixedHeight(20)
         self.btn_eyedropper.setStyleSheet("""
@@ -2477,12 +2689,12 @@ class PPTCloneApp(QMainWindow):
         alpha_layout = QHBoxLayout(alpha_row)
         alpha_layout.setContentsMargins(0, 0, 0, 0)
         alpha_layout.setSpacing(8)
-        alpha_lbl = QLabel("背景透明度:")
+        alpha_lbl = QLabel(self._t("背景透明度:", "BG transparency:"))
         alpha_lbl.setStyleSheet("font-size: 12px;")
         alpha_layout.addWidget(alpha_lbl)
         self.slider_global_alpha = QSlider(Qt.Horizontal)
         self.slider_global_alpha.setRange(0, 255)
-        self.slider_global_alpha.setToolTip("0=不透明，255=全透明")
+        self.slider_global_alpha.setToolTip(self._t("0=不透明，255=全透明", "0 = opaque, 255 = transparent"))
         try:
             self.slider_global_alpha.setValue(255 - int(getattr(self, "text_bg_alpha", 120)))
         except Exception:
@@ -2502,10 +2714,10 @@ class PPTCloneApp(QMainWindow):
         lay_view.addWidget(RibbonSeparator())
 
         # --- Group: 预览 ---
-        grp_preview = RibbonGroup("预览")
+        grp_preview = RibbonGroup(self._t("预览", "Preview"))
         grp_preview.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         grp_preview.setFixedWidth(90)
-        btn_preview_ppt = RibbonLargeBtn("预览\nPPT", "fa5s.eye", color=PPT_THEME_RED)
+        btn_preview_ppt = RibbonLargeBtn(self._t("预览\nPPT", "Preview\nPPT"), "fa5s.eye", color=PPT_THEME_RED)
         btn_preview_ppt.clicked.connect(self.preview_ppt)
         grp_preview.add_widget(btn_preview_ppt)
         lay_view.addWidget(grp_preview)
@@ -2513,7 +2725,7 @@ class PPTCloneApp(QMainWindow):
 
         lay_view.addStretch()
 
-        self.tabs.addTab(tab_view, "视图")
+        self.tabs.addTab(tab_view, self._t("视图", "View"))
 
         # --- 设置标签页（替代顶部菜单：设置/编辑放到这里，风格与“开始/视图”一致） ---
         tab_settings = QWidget()
@@ -2521,12 +2733,12 @@ class PPTCloneApp(QMainWindow):
         lay_settings.setContentsMargins(4, 0, 4, 0)
         lay_settings.setSpacing(2)
 
-        grp_settings = RibbonGroup("设置")
-        btn_ocr_settings = RibbonLargeBtn("OCR\n设置", "fa5s.cog", color=PPT_THEME_RED)
+        grp_settings = RibbonGroup(self._t("设置", "Settings"))
+        btn_ocr_settings = RibbonLargeBtn(self._t("OCR\n设置", "OCR\nSettings"), "fa5s.cog", color=PPT_THEME_RED)
         btn_ocr_settings.clicked.connect(self.open_ocr_settings)
-        btn_reload_ocr = RibbonLargeBtn("重新加载\nOCR", "fa5s.sync", color=PPT_THEME_RED)
+        btn_reload_ocr = RibbonLargeBtn(self._t("重新加载\nOCR", "Reload\nOCR"), "fa5s.sync", color=PPT_THEME_RED)
         btn_reload_ocr.clicked.connect(self.force_reload_ocr_engine)
-        btn_inpaint_settings = RibbonLargeBtn("IOPaint\n设置", "fa5s.eraser", color=PPT_THEME_RED)
+        btn_inpaint_settings = RibbonLargeBtn(self._t("IOPaint\n设置", "IOPaint\nSettings"), "fa5s.eraser", color=PPT_THEME_RED)
         btn_inpaint_settings.clicked.connect(self.open_inpaint_settings)
         grp_settings.add_widget(btn_ocr_settings)
         grp_settings.add_widget(btn_reload_ocr)
@@ -2534,10 +2746,41 @@ class PPTCloneApp(QMainWindow):
         lay_settings.addWidget(grp_settings)
         lay_settings.addWidget(RibbonSeparator())
 
-        grp_edit = RibbonGroup("编辑")
-        btn_undo = RibbonLargeBtn("撤销", "fa5s.undo")
+        # --- Language selector (saved to settings.json; restart to apply) ---
+        grp_lang = RibbonGroup(self._t("语言", "Language"))
+
+        # 使用大按钮风格，与其他设置保持一致
+        self.btn_lang_auto = RibbonLargeBtn(self._t("跟随\n系统", "Auto\n(System)"), "fa5s.globe", color="#666")
+        self.btn_lang_zh = RibbonLargeBtn(self._t("中文", "中文"), "fa5s.language", color="#666")
+        self.btn_lang_en = RibbonLargeBtn("English", "fa5s.language", color="#666")
+
+        # 设置当前语言
+        pref_norm = str(getattr(self, "ui_lang_setting", "auto") or "auto").strip().lower().replace("_", "-")
+        if pref_norm in ("zh", "zh-cn", "cn"):
+            self._current_ui_lang = "zh"
+        elif pref_norm in ("en", "en-us"):
+            self._current_ui_lang = "en"
+        else:
+            self._current_ui_lang = "auto"
+
+        # 连接点击事件
+        self.btn_lang_auto.clicked.connect(lambda: self.on_ui_lang_btn_clicked("auto"))
+        self.btn_lang_zh.clicked.connect(lambda: self.on_ui_lang_btn_clicked("zh"))
+        self.btn_lang_en.clicked.connect(lambda: self.on_ui_lang_btn_clicked("en"))
+
+        # 初始化按钮状态
+        self._update_lang_button_styles()
+
+        grp_lang.add_widget(self.btn_lang_auto)
+        grp_lang.add_widget(self.btn_lang_zh)
+        grp_lang.add_widget(self.btn_lang_en)
+        lay_settings.addWidget(grp_lang)
+        lay_settings.addWidget(RibbonSeparator())
+
+        grp_edit = RibbonGroup(self._t("编辑", "Edit"))
+        btn_undo = RibbonLargeBtn(self._t("撤销", "Undo"), "fa5s.undo")
         btn_undo.clicked.connect(self.undo)
-        btn_redo = RibbonLargeBtn("重做", "fa5s.redo")
+        btn_redo = RibbonLargeBtn(self._t("重做", "Redo"), "fa5s.redo")
         btn_redo.clicked.connect(self.redo)
         grp_edit.add_widget(btn_undo)
         grp_edit.add_widget(btn_redo)
@@ -2546,13 +2789,13 @@ class PPTCloneApp(QMainWindow):
         l_edit_small = QVBoxLayout(w_edit_small)
         l_edit_small.setContentsMargins(0, 4, 0, 0)
         l_edit_small.setSpacing(0)
-        b_cut = RibbonSmallBtn("剪切", "fa5s.cut")
+        b_cut = RibbonSmallBtn(self._t("剪切", "Cut"), "fa5s.cut")
         b_cut.clicked.connect(self.cut_selected_box)
         l_edit_small.addWidget(b_cut)
-        b_copy = RibbonSmallBtn("复制", "fa5s.copy")
+        b_copy = RibbonSmallBtn(self._t("复制", "Copy"), "fa5s.copy")
         b_copy.clicked.connect(self.copy_selected_box)
         l_edit_small.addWidget(b_copy)
-        b_paste = RibbonSmallBtn("粘贴", "fa5s.paste")
+        b_paste = RibbonSmallBtn(self._t("粘贴", "Paste"), "fa5s.paste")
         b_paste.clicked.connect(self.paste_box)
         l_edit_small.addWidget(b_paste)
         l_edit_small.addStretch()
@@ -2562,7 +2805,7 @@ class PPTCloneApp(QMainWindow):
         lay_settings.addWidget(RibbonSeparator())
         lay_settings.addStretch()
 
-        self.tabs.addTab(tab_settings, "设置")
+        self.tabs.addTab(tab_settings, self._t("设置", "Settings"))
         
         # === 2. CENTER AREA ===
         central_widget = QWidget()
@@ -2630,10 +2873,10 @@ class PPTCloneApp(QMainWindow):
         sb_layout.setContentsMargins(10, 0, 15, 0)
         sb_layout.setSpacing(8)
         
-        self.lbl_page = QPushButton("幻灯片 0 / 0") # 样式在 Global CSS 中
+        self.lbl_page = QPushButton(self._t("幻灯片 0 / 0", "Slide 0 / 0")) # 样式在 Global CSS 中
         sb_layout.addWidget(self.lbl_page)
         
-        btn_lang = QPushButton("中文(中国)")
+        btn_lang = QPushButton(self._t("中文", "English"))
         sb_layout.addWidget(btn_lang)
         
         sb_layout.addStretch()
@@ -2641,25 +2884,26 @@ class PPTCloneApp(QMainWindow):
         # Bottom quick buttons: bind to the same actions/shortcuts.
         btn_help = QPushButton()
         btn_help.setIcon(qta.icon("fa5s.keyboard", color="white"))
-        btn_help.setToolTip("快捷键 (F1)")
+        btn_help.setToolTip(self._t("快捷键 (F1)", "Shortcuts (F1)"))
         btn_help.clicked.connect(self.show_shortcuts)
         sb_layout.addWidget(btn_help)
 
         btn_toggle_left = QPushButton()
         btn_toggle_left.setIcon(qta.icon("fa5s.th-large", color="white"))
-        btn_toggle_left.setToolTip("显示/隐藏缩略图 (Ctrl+Alt+L)")
+        btn_toggle_left.setToolTip(self._t("显示/隐藏缩略图 (Ctrl+Alt+L)", "Toggle thumbnails (Ctrl+Alt+L)"))
         btn_toggle_left.clicked.connect(self.toggle_left_panel)
         sb_layout.addWidget(btn_toggle_left)
 
         btn_preview = QPushButton()
         # “电脑/显示器”图标：预览PPT
         btn_preview.setIcon(qta.icon("fa5s.tv", color="white"))
-        btn_preview.setToolTip("预览PPT (F5)")
+        btn_preview.setToolTip(self._t("预览PPT (F5)", "Preview PPT (F5)"))
         btn_preview.clicked.connect(self.preview_ppt)
         sb_layout.addWidget(btn_preview)
         
         btn_fit = QPushButton()
         btn_fit.setIcon(qta.icon("fa5s.expand-arrows-alt", color="white"))
+        btn_fit.setToolTip(self._t("适应窗口 (Ctrl+0)", "Fit to window (Ctrl+0)"))
         btn_fit.clicked.connect(self.fit_view_to_window)
         sb_layout.addWidget(btn_fit)
         
@@ -2714,23 +2958,25 @@ class PPTCloneApp(QMainWindow):
         l = QVBoxLayout(self.right_panel)
         # 右侧面板宽度固定，减小内边距避免控件被挤到右侧边缘
         l.setContentsMargins(12, 18, 16, 18)
-        hdr = QLabel("设置对象格式")
+        hdr = QLabel(self._t("设置对象格式", "Format Selection"))
         hdr.setStyleSheet("font-weight: bold; font-size: 14px; margin-bottom: 12px;")
         l.addWidget(hdr)
-        l.addWidget(QLabel("文本内容:"))
+        l.addWidget(QLabel(self._t("文本内容:", "Text:")))
         self.txt_edit = QTextEdit()
         self.txt_edit.setFixedHeight(100)
         self.txt_edit.setStyleSheet("border: 1px solid #CCC; background: #FAFAFA;")
         self.txt_edit.textChanged.connect(self.sync_text_change)
         l.addWidget(self.txt_edit)
         l.addSpacing(10)
-        l.addWidget(QLabel("字体大小:"))
+        l.addWidget(QLabel(self._t("字体大小:", "Font size:")))
         self.slider_font = QSlider(Qt.Horizontal)
         self.slider_font.setStyleSheet("""
             QSlider::groove:horizontal { height: 3px; background: #DDD; }
             QSlider::handle:horizontal { background: #D24726; width: 12px; height: 12px; margin: -5px 0; border-radius: 6px; }
         """)
-        self.slider_font.setRange(8, 72)
+        # PPT title text can easily exceed 72pt (e.g. 1080p/4K slides). Keep the UI range large enough
+        # so selecting a big box doesn't clamp the value to the slider max.
+        self.slider_font.setRange(6, 600)
         self.slider_font.setValue(12)
         self.slider_font.valueChanged.connect(self.on_font_size_changed)
         self.slider_font.sliderPressed.connect(self.push_undo)
@@ -2738,7 +2984,7 @@ class PPTCloneApp(QMainWindow):
         l.addSpacing(10)
 
         # 文字颜色 + 加粗 + 对齐（改为两行布局，避免窄面板时被裁切）
-        l.addWidget(QLabel("文字样式:"))
+        l.addWidget(QLabel(self._t("文字样式:", "Text style:")))
         text_style_row = QWidget()
         ts = QGridLayout(text_style_row)
         ts.setContentsMargins(0, 0, 0, 0)
@@ -2749,29 +2995,29 @@ class PPTCloneApp(QMainWindow):
         self.text_color_preview.setFixedSize(40, 30)
         self.text_color_preview.setStyleSheet("background: black; border: 1px solid #ccc;")
         ts.addWidget(self.text_color_preview, 0, 0, 1, 1)
-        self.btn_text_color = QPushButton("文字颜色")
+        self.btn_text_color = QPushButton(self._t("文字颜色", "Text color"))
         self.btn_text_color.setIcon(qta.icon("fa5s.font", color="#666"))
         self.btn_text_color.clicked.connect(self.choose_text_color)
         self.btn_text_color.setEnabled(False)
         self.btn_text_color.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ts.addWidget(self.btn_text_color, 0, 1, 1, 2)
 
-        self.chk_bold = QCheckBox("加粗")
+        self.chk_bold = QCheckBox(self._t("加粗", "Bold"))
         self.chk_bold.stateChanged.connect(self.toggle_bold)
         self.chk_bold.setEnabled(False)
         ts.addWidget(self.chk_bold, 0, 3, 1, 1)
 
-        self.btn_align_left = QPushButton("左")
+        self.btn_align_left = QPushButton(self._t("左", "L"))
         self.btn_align_left.clicked.connect(lambda: self.set_align("left"))
         self.btn_align_left.setEnabled(False)
         self.btn_align_left.setFixedWidth(34)
         ts.addWidget(self.btn_align_left, 1, 1, 1, 1)
-        self.btn_align_center = QPushButton("中")
+        self.btn_align_center = QPushButton(self._t("中", "C"))
         self.btn_align_center.clicked.connect(lambda: self.set_align("center"))
         self.btn_align_center.setEnabled(False)
         self.btn_align_center.setFixedWidth(34)
         ts.addWidget(self.btn_align_center, 1, 2, 1, 1)
-        self.btn_align_right = QPushButton("右")
+        self.btn_align_right = QPushButton(self._t("右", "R"))
         self.btn_align_right.clicked.connect(lambda: self.set_align("right"))
         self.btn_align_right.setEnabled(False)
         self.btn_align_right.setFixedWidth(34)
@@ -2781,14 +3027,14 @@ class PPTCloneApp(QMainWindow):
         l.addSpacing(10)
 
         # 单独背景色设置
-        l.addWidget(QLabel("文本框背景色:"))
+        l.addWidget(QLabel(self._t("文本框背景色:", "Text box background:")))
         bg_container = QWidget()
         bg_layout = QGridLayout(bg_container)
         bg_layout.setContentsMargins(0, 0, 0, 0)
         bg_layout.setHorizontalSpacing(6)
         bg_layout.setVerticalSpacing(6)
 
-        self.chk_custom_bg = QCheckBox("自定义")
+        self.chk_custom_bg = QCheckBox(self._t("自定义", "Custom"))
         self.chk_custom_bg.stateChanged.connect(self.toggle_custom_bg)
         bg_layout.addWidget(self.chk_custom_bg, 0, 0, 1, 1)
 
@@ -2797,14 +3043,14 @@ class PPTCloneApp(QMainWindow):
         self.custom_color_preview.setStyleSheet("background-color: white; border: 1px solid #ccc;")
         bg_layout.addWidget(self.custom_color_preview, 0, 1, 1, 1)
 
-        self.btn_choose_custom_color = QPushButton("选择")
+        self.btn_choose_custom_color = QPushButton(self._t("选择", "Choose"))
         self.btn_choose_custom_color.setIcon(qta.icon("fa5s.palette", color="#666"))
         self.btn_choose_custom_color.clicked.connect(self.choose_custom_color)
         self.btn_choose_custom_color.setEnabled(False)
         self.btn_choose_custom_color.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         bg_layout.addWidget(self.btn_choose_custom_color, 1, 0, 1, 1)
 
-        self.btn_pick_custom_color = QPushButton("吸管")
+        self.btn_pick_custom_color = QPushButton(self._t("吸管", "Pick"))
         self.btn_pick_custom_color.setIcon(qta.icon("fa5s.eye-dropper", color="#666"))
         self.btn_pick_custom_color.setCheckable(True)
         self.btn_pick_custom_color.setStyleSheet("""
@@ -2820,10 +3066,10 @@ class PPTCloneApp(QMainWindow):
         bg_layout.setColumnStretch(1, 1)
         l.addWidget(bg_container)
 
-        l.addWidget(QLabel("背景透明度:"))
+        l.addWidget(QLabel(self._t("背景透明度:", "BG transparency:")))
         self.slider_bg_alpha = QSlider(Qt.Horizontal)
         self.slider_bg_alpha.setRange(0, 255)
-        self.slider_bg_alpha.setToolTip("0=不透明，255=全透明")
+        self.slider_bg_alpha.setToolTip(self._t("0=不透明，255=全透明", "0 = opaque, 255 = transparent"))
         # UI 透明度：255-alpha
         self.slider_bg_alpha.setValue(135)
         self.slider_bg_alpha.valueChanged.connect(self.on_bg_alpha_changed)
@@ -2834,13 +3080,13 @@ class PPTCloneApp(QMainWindow):
 
         # 右侧面板不再提供“边框”设置（仅保留编辑时的虚线选中框）
 
-        self.btn_apply_style_page = QPushButton("应用样式到本页全部文本框")
+        self.btn_apply_style_page = QPushButton(self._t("应用样式到本页全部文本框", "Apply style to all boxes (slide)"))
         self.btn_apply_style_page.clicked.connect(self.apply_style_to_current_slide)
         self.btn_apply_style_page.setEnabled(False)
         l.addWidget(self.btn_apply_style_page)
 
         l.addStretch()
-        btn_del = QPushButton(" 删除选中框")
+        btn_del = QPushButton(self._t("删除选中框", "Delete selected box"))
         btn_del.setIcon(qta.icon("fa5s.trash-alt", color="#D24726"))
         btn_del.setStyleSheet("QPushButton { border: 1px solid #D24726; color: #D24726; padding: 6px; background: white; border-radius: 4px; } QPushButton:hover { background: #FFF3F0; }")
         btn_del.clicked.connect(self.delete_box)
@@ -2862,9 +3108,9 @@ class PPTCloneApp(QMainWindow):
 
         # Keep scaled images under run_cache_dir by default (instead of C:\\Temp), and still clean on exit.
         try:
-            import time as _t
+            import time as _time_mod
             base_dir = getattr(self, "run_cache_dir", None) or tempfile.gettempdir()
-            ts = int(_t.time() * 1000)
+            ts = int(_time_mod.time() * 1000)
             self.temp_dir = os.path.join(str(base_dir), f"ocr_scaled_{ts}")
             os.makedirs(self.temp_dir, exist_ok=True)
         except Exception:
@@ -2901,11 +3147,16 @@ class PPTCloneApp(QMainWindow):
                 self.scaled_images[original_path] = scaled_path
 
             except Exception as e:
-                print(f"缩放图片失败 {original_path}: {e}")
+                logger.warning(f"缩放图片失败 {original_path}: {e}")
                 self.scaled_images[original_path] = original_path
 
     def import_images(self):
-        paths, _ = QFileDialog.getOpenFileNames(None, "导入", "", "Images (*.jpg *.png)")
+        paths, _ = QFileDialog.getOpenFileNames(
+            None,
+            self._t("导入图片", "Import Images"),
+            "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff)",
+        )
         if not paths: return
         for p in paths:
             self._add_image_item(p)
@@ -2913,14 +3164,18 @@ class PPTCloneApp(QMainWindow):
 
     def import_pdfs(self):
         """导入 PDF：把每一页渲染成图片后加入左侧缩略图列表，供 OCR 识别/导出"""
-        paths, _ = QFileDialog.getOpenFileNames(None, "导入PDF", "", "PDF (*.pdf)")
+        paths, _ = QFileDialog.getOpenFileNames(None, self._t("导入PDF", "Import PDF"), "", "PDF (*.pdf)")
         if not paths:
             return
 
         try:
             import fitz  # PyMuPDF
         except Exception:
-            QMessageBox.critical(self, "缺少依赖", "导入PDF需要 PyMuPDF。\n请先安装：pip install pymupdf")
+            QMessageBox.critical(
+                self,
+                self._t("缺少依赖", "Missing dependency"),
+                self._t("导入PDF需要 PyMuPDF。\n请先安装：pip install pymupdf", "PDF import requires PyMuPDF.\nInstall first: pip install pymupdf"),
+            )
             return
 
         # 预先统计总页数用于进度条
@@ -2932,7 +3187,11 @@ class PPTCloneApp(QMainWindow):
                 docs.append((p, doc))
                 total_pages += int(getattr(doc, "page_count", 0) or 0)
             except Exception as e:
-                QMessageBox.warning(self, "提示", f"无法打开PDF：{p}\n{e}")
+                QMessageBox.warning(
+                    self,
+                    self._t("提示", "Info"),
+                    self._t(f"无法打开PDF：{p}\n{e}", f"Failed to open PDF: {p}\n{e}"),
+                )
 
         if total_pages <= 0:
             for _, d in docs:
@@ -2942,8 +3201,8 @@ class PPTCloneApp(QMainWindow):
                     pass
             return
 
-        progress = QProgressDialog("正在导入PDF...", "取消", 0, total_pages, self)
-        progress.setWindowTitle("导入PDF")
+        progress = QProgressDialog(self._t("正在导入PDF...", "Importing PDF..."), self._t("取消", "Cancel"), 0, total_pages, self)
+        progress.setWindowTitle(self._t("导入PDF", "Import PDF"))
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
@@ -2969,7 +3228,11 @@ class PPTCloneApp(QMainWindow):
                         pix.save(out_path)
                         self._add_image_item(out_path)
                     except Exception as e:
-                        QMessageBox.warning(self, "提示", f"PDF渲染失败：{pdf_path}\n第 {page_index+1} 页\n{e}")
+                        QMessageBox.warning(
+                            self,
+                            self._t("提示", "Info"),
+                            self._t(f"PDF渲染失败：{pdf_path}\n第 {page_index+1} 页\n{e}", f"PDF render failed: {pdf_path}\nPage {page_index+1}\n{e}"),
+                        )
                     imported += 1
                     progress.setValue(imported)
                 if canceled:
@@ -2990,11 +3253,19 @@ class PPTCloneApp(QMainWindow):
 
     def _ensure_inpaint_ready(self) -> bool:
         if not bool(self.settings.get("inpaint_enabled", True)):
-            QMessageBox.warning(self, "提示", "IOPaint 去字功能已在设置中关闭")
+            QMessageBox.warning(
+                self,
+                self._t("提示", "Info"),
+                self._t("IOPaint 去字功能已在设置中关闭", "IOPaint is disabled in Settings."),
+            )
             return False
         api_urls = parse_inpaint_api_urls(self.settings.get("inpaint_api_url"))
         if not api_urls:
-            QMessageBox.warning(self, "提示", "请先在【设置】里填写 IOPaint API 地址（可多行，每行一个）")
+            QMessageBox.warning(
+                self,
+                self._t("提示", "Info"),
+                self._t("请先在【设置】里填写 IOPaint API 地址", "Please set the IOPaint API URL in Settings first."),
+            )
             return False
         return True
 
@@ -3024,12 +3295,16 @@ class PPTCloneApp(QMainWindow):
     def inpaint_current_slide(self, *args):
         """IOPaint：对当前页按 OCR 文本框去字，生成纯背景底图（替换当前图片）。"""
         if not self.images or not self.current_img:
-            QMessageBox.warning(self, "提示", "请先导入图片")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
             return
         if not self._ensure_inpaint_ready():
             return
         if not (self.box_data.get(self.current_img) or []):
-            QMessageBox.warning(self, "提示", "当前页没有文本框数据，请先运行 OCR 识别")
+            QMessageBox.warning(
+                self,
+                self._t("提示", "Info"),
+                self._t("当前页没有文本框数据，请先运行 OCR 识别", "No OCR boxes on this slide. Run OCR first."),
+            )
             return
 
         self._run_inpaint([self.current_img])
@@ -3037,12 +3312,16 @@ class PPTCloneApp(QMainWindow):
     def inpaint_all_slides(self, *args):
         """IOPaint：批量对全部图片页按 OCR 文本框去字。"""
         if not self.images:
-            QMessageBox.warning(self, "提示", "请先导入图片")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
             return
         if not self._ensure_inpaint_ready():
             return
         if not any(self.box_data.get(p) for p in self.images):
-            QMessageBox.warning(self, "提示", "没有文本框数据，请先运行 OCR 识别")
+            QMessageBox.warning(
+                self,
+                self._t("提示", "Info"),
+                self._t("没有文本框数据，请先运行 OCR 识别", "No OCR boxes found. Run OCR first."),
+            )
             return
 
         self._run_inpaint(list(self.images))
@@ -3059,7 +3338,11 @@ class PPTCloneApp(QMainWindow):
         try:
             th = getattr(self, "inpaint_thread", None)
             if th is not None and th.isRunning():
-                QMessageBox.information(self, "提示", "IOPaint 去字正在运行，请先等待完成或取消。")
+                QMessageBox.information(
+                    self,
+                    self._t("提示", "Info"),
+                    self._t("IOPaint 去字正在运行，请先等待完成或取消。", "IOPaint is running. Please wait or cancel first."),
+                )
                 return
         except Exception:
             pass
@@ -3074,14 +3357,13 @@ class PPTCloneApp(QMainWindow):
 
         # Inpaint should operate on what the user currently sees (original vs inpaint preview),
         # so that users can iteratively refine an already-inpainted page by selecting ROI and running again.
-        input_image_by_src = {}
         try:
             input_image_by_src = {p: self._get_display_image_path(p) for p in images_to_run}
         except Exception:
             input_image_by_src = {}
 
-        progress = QProgressDialog("正在调用 IOPaint 去字...", "取消", 0, len(images_to_run), self)
-        progress.setWindowTitle("IOPaint 去字")
+        progress = QProgressDialog(self._t("正在调用 IOPaint 去字...", "Calling IOPaint..."), self._t("取消", "Cancel"), 0, len(images_to_run), self)
+        progress.setWindowTitle(self._t("IOPaint 去字", "IOPaint Clean"))
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
@@ -3111,8 +3393,11 @@ class PPTCloneApp(QMainWindow):
                 pass
             QMessageBox.critical(
                 self,
-                "IOPaint 失败",
-                f"{msg}\n\n请确认 IOPaint 服务已启动，并且 API 地址正确：\n{api_url_hint}",
+                self._t("IOPaint 失败", "IOPaint failed"),
+                self._t(
+                    f"{msg}\n\n请确认 IOPaint 服务已启动，并且 API 地址正确：\n{api_url_hint}",
+                    f"{msg}\n\nPlease make sure the IOPaint service is running and the API URL is correct:\n{api_url_hint}",
+                ),
             )
 
         def on_done(canceled: bool):
@@ -3124,7 +3409,11 @@ class PPTCloneApp(QMainWindow):
             if reps:
                 self._apply_inpaint_results(reps)
             if canceled:
-                QMessageBox.information(self, "提示", "已取消 IOPaint 去字")
+                QMessageBox.information(
+                    self,
+                    self._t("提示", "Info"),
+                    self._t("已取消 IOPaint 去字", "IOPaint canceled."),
+                )
 
         self.inpaint_thread.error.connect(on_error)
         self.inpaint_thread.all_done.connect(on_done)
@@ -3133,12 +3422,12 @@ class PPTCloneApp(QMainWindow):
     def run_ocr_simulation(self, images=None):
         """运行OCR识别（默认全部；传入 images 可只识别单页/子集）"""
         if not self.images:
-            QMessageBox.warning(self, "提示", "请先导入图片")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
             return
 
         images_to_run = list(self.images) if images is None else [p for p in images if p]
         if not images_to_run:
-            QMessageBox.warning(self, "提示", "没有可识别的图片")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("没有可识别的图片", "No images to OCR."))
             return
 
         if not self.ensure_ocr_engine():
@@ -3148,7 +3437,11 @@ class PPTCloneApp(QMainWindow):
         try:
             th = getattr(self, "ocr_thread", None)
             if th is not None and th.isRunning():
-                QMessageBox.information(self, "提示", "OCR 正在运行，请先等待完成或取消。")
+                QMessageBox.information(
+                    self,
+                    self._t("提示", "Info"),
+                    self._t("OCR 正在运行，请先等待完成或取消。", "OCR is running. Please wait or cancel first."),
+                )
                 return
         except Exception:
             pass
@@ -3157,8 +3450,8 @@ class PPTCloneApp(QMainWindow):
         self.scale_images_to_1080p(images_to_run)
 
         # 创建进度对话框
-        progress = QProgressDialog("正在识别...", "取消", 0, len(images_to_run), self)
-        progress.setWindowTitle("OCR识别")
+        progress = QProgressDialog(self._t("正在识别...", "Running OCR..."), self._t("取消", "Cancel"), 0, len(images_to_run), self)
+        progress.setWindowTitle(self._t("OCR识别", "OCR"))
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
@@ -3180,7 +3473,7 @@ class PPTCloneApp(QMainWindow):
     def run_ocr_current_slide(self):
         """OCR：仅识别当前页"""
         if not self.current_img:
-            QMessageBox.warning(self, "提示", "请先选择一页图片")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先选择一页图片", "Please select an image/slide first."))
             return
         self.run_ocr_simulation([self.current_img])
 
@@ -3209,14 +3502,14 @@ class PPTCloneApp(QMainWindow):
             self.update_status()
             self.list_thumb.setCurrentRow(len(self.images) - 1)
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"新建空白图层失败: {e}")
+            QMessageBox.critical(self, self._t("错误", "Error"), self._t(f"新建空白图层失败: {e}", f"Failed to create blank slide: {e}"))
 
     def delete_slide(self, *args):
         """删除当前页（同时删除该页的文本框数据）"""
         idx = self.list_thumb.currentRow()
         if idx < 0 or idx >= len(self.images):
             return
-        if QMessageBox.question(self, "确认删除", "确定删除当前页吗？") != QMessageBox.Yes:
+        if QMessageBox.question(self, self._t("确认删除", "Confirm"), self._t("确定删除当前页吗？", "Delete current slide?")) != QMessageBox.Yes:
             return
 
         self.push_undo()
@@ -3252,7 +3545,7 @@ class PPTCloneApp(QMainWindow):
         try:
             shutil.copyfile(src, dst)
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"复制页面图片失败: {e}")
+            QMessageBox.critical(self, self._t("错误", "Error"), self._t(f"复制页面图片失败: {e}", f"Failed to duplicate slide image: {e}"))
             return
 
         # 深拷贝文本框数据
@@ -3297,7 +3590,7 @@ class PPTCloneApp(QMainWindow):
         self.push_undo()
         model = {
             "rect": [int(x), int(y), int(box_w), int(box_h)],
-            "text": "文本框",
+            "text": self._t("文本框", "Text Box"),
             "confidence": 1.0,
             "use_custom_bg": False,
             "bg_color": None,
@@ -3361,7 +3654,7 @@ class PPTCloneApp(QMainWindow):
         # 2) Raw image data (e.g. screenshot)
         if not md.hasImage():
             if show_message:
-                QMessageBox.information(self, "提示", "剪贴板里没有图片")
+                QMessageBox.information(self, self._t("提示", "Info"), self._t("剪贴板里没有图片", "No image in clipboard."))
             return False
 
         img = cb.image()
@@ -3373,7 +3666,7 @@ class PPTCloneApp(QMainWindow):
                 img = None
         if img is None or img.isNull():
             if show_message:
-                QMessageBox.information(self, "提示", "剪贴板里没有有效图片")
+                QMessageBox.information(self, self._t("提示", "Info"), self._t("剪贴板里没有有效图片", "No valid image in clipboard."))
             return False
 
         # Save into project temp assets so it behaves like imported images (and gets cleaned up on exit).
@@ -3386,10 +3679,14 @@ class PPTCloneApp(QMainWindow):
                 out_path = os.path.join(self.slide_assets_dir, f"clipboard_{stamp}.jpg")
                 ok = img.save(out_path, "JPG")
             if not ok or not os.path.exists(out_path):
-                QMessageBox.warning(self, "提示", "从剪贴板保存图片失败")
+                QMessageBox.warning(self, self._t("提示", "Info"), self._t("从剪贴板保存图片失败", "Failed to save clipboard image."))
                 return False
         except Exception as e:
-            QMessageBox.warning(self, "提示", f"从剪贴板导入图片失败：{e}")
+            QMessageBox.warning(
+                self,
+                self._t("提示", "Info"),
+                self._t(f"从剪贴板导入图片失败：{e}", f"Failed to import image from clipboard: {e}"),
+            )
             return False
 
         self._add_image_item(out_path)
@@ -3557,34 +3854,7 @@ class PPTCloneApp(QMainWindow):
             self.txt_edit.clear()
             self.txt_edit.blockSignals(False)
         # 右侧面板状态重置（避免切换页后仍显示上一个框的自定义设置）
-        if hasattr(self, "chk_custom_bg"):
-            self.chk_custom_bg.blockSignals(True)
-            self.chk_custom_bg.setChecked(False)
-            self.chk_custom_bg.blockSignals(False)
-        if hasattr(self, "btn_choose_custom_color"):
-            self.btn_choose_custom_color.setEnabled(False)
-        if hasattr(self, "btn_pick_custom_color"):
-            self.btn_pick_custom_color.setEnabled(False)
-        if hasattr(self, "btn_text_color"):
-            self.btn_text_color.setEnabled(False)
-        if hasattr(self, "chk_bold"):
-            self.chk_bold.setEnabled(False)
-        if hasattr(self, "btn_align_left"):
-            self.btn_align_left.setEnabled(False)
-        if hasattr(self, "btn_align_center"):
-            self.btn_align_center.setEnabled(False)
-        if hasattr(self, "btn_align_right"):
-            self.btn_align_right.setEnabled(False)
-        if hasattr(self, "slider_bg_alpha"):
-            self.slider_bg_alpha.setEnabled(False)
-        if hasattr(self, "chk_border"):
-            self.chk_border.setEnabled(False)
-        if hasattr(self, "btn_border_color"):
-            self.btn_border_color.setEnabled(False)
-        if hasattr(self, "slider_border_w"):
-            self.slider_border_w.setEnabled(False)
-        if hasattr(self, "btn_apply_style_page"):
-            self.btn_apply_style_page.setEnabled(False)
+        self._reset_right_panel_state()
         self.scene.clear()
         pix = QPixmap(self._get_display_image_path(self.current_img))
         self._current_pixmap = pix
@@ -3594,6 +3864,37 @@ class PPTCloneApp(QMainWindow):
         self._draw_roi_overlay()
         self.scene.setSceneRect(-50, -50, pix.width()+100, pix.height()+100)
         self.fit_view_to_window(); self.update_status()
+
+    def _reset_right_panel_state(self):
+        """重置右侧面板控件状态（取消选中、禁用等）"""
+        # 自定义背景复选框
+        if hasattr(self, "chk_custom_bg") and self.chk_custom_bg is not None:
+            self.chk_custom_bg.blockSignals(True)
+            self.chk_custom_bg.setChecked(False)
+            self.chk_custom_bg.blockSignals(False)
+        # 需要禁用的按钮/控件列表
+        self._enable_right_panel_widgets(False)
+
+    def _enable_right_panel_widgets(self, enabled: bool):
+        """批量启用/禁用右侧面板中与文本框属性相关的控件"""
+        widgets_to_toggle = [
+            "btn_choose_custom_color",
+            "btn_pick_custom_color",
+            "btn_text_color",
+            "chk_bold",
+            "btn_align_left",
+            "btn_align_center",
+            "btn_align_right",
+            "slider_bg_alpha",
+            "btn_apply_style_page",
+        ]
+        for name in widgets_to_toggle:
+            widget = getattr(self, name, None)
+            if widget is not None:
+                try:
+                    widget.setEnabled(enabled)
+                except Exception:
+                    pass
 
     def _build_scene_background(self, pix: QPixmap):
         """创建/重建画布背景层（阴影/白底/图片），并固定 z 值，避免重绘时底图层级异常。"""
@@ -3638,7 +3939,7 @@ class PPTCloneApp(QMainWindow):
             self._bg_white_item = bg
             self._bg_pixmap_item = pm
         except Exception as e:
-            print(f"重建背景层失败: {e}")
+            logger.warning(f"重建背景层失败: {e}")
 
     def _ensure_scene_background(self):
         """确保背景图片层存在且有效；用于拖动透明度时修复 Qt 偶发的“底图不见”重绘问题。"""
@@ -3798,31 +4099,8 @@ class PPTCloneApp(QMainWindow):
             else:
                 self.update_custom_color_preview(QColor(255, 255, 255))
 
-        # 只要选中了文本框，就允许点“选择/吸管”；是否启用背景由“自定义”勾选控制
-        if hasattr(self, "btn_choose_custom_color"):
-            self.btn_choose_custom_color.setEnabled(True)
-        if hasattr(self, "btn_pick_custom_color"):
-            self.btn_pick_custom_color.setEnabled(True)
-        if hasattr(self, "btn_text_color"):
-            self.btn_text_color.setEnabled(True)
-        if hasattr(self, "chk_bold"):
-            self.chk_bold.setEnabled(True)
-        if hasattr(self, "btn_align_left"):
-            self.btn_align_left.setEnabled(True)
-        if hasattr(self, "btn_align_center"):
-            self.btn_align_center.setEnabled(True)
-        if hasattr(self, "btn_align_right"):
-            self.btn_align_right.setEnabled(True)
-        if hasattr(self, "slider_bg_alpha"):
-            self.slider_bg_alpha.setEnabled(True)
-        if hasattr(self, "chk_border"):
-            self.chk_border.setEnabled(True)
-        if hasattr(self, "btn_border_color"):
-            self.btn_border_color.setEnabled(True)
-        if hasattr(self, "slider_border_w"):
-            self.slider_border_w.setEnabled(True)
-        if hasattr(self, "btn_apply_style_page"):
-            self.btn_apply_style_page.setEnabled(True)
+        # 只要选中了文本框，就允许点"选择/吸管"；是否启用背景由"自定义"勾选控制
+        self._enable_right_panel_widgets(True)
 
         self.refresh_right_panel_from_selected()
 
@@ -3870,27 +4148,13 @@ class PPTCloneApp(QMainWindow):
         # 背景透明度
         try:
             self.slider_bg_alpha.blockSignals(True)
-            # UI 使用“透明度”，内部存 alpha
+            # UI 使用"透明度"，内部存 alpha
             self.slider_bg_alpha.setValue(255 - int(m.get("bg_alpha", 120)))
             self.slider_bg_alpha.blockSignals(False)
         except Exception:
             pass
 
-        # 边框
-        try:
-            self.chk_border.blockSignals(True)
-            self.chk_border.setChecked(bool(m.get("border_enabled", False)))
-            self.chk_border.blockSignals(False)
-            self.slider_border_w.blockSignals(True)
-            self.slider_border_w.setValue(int(m.get("border_width", 1)))
-            self.slider_border_w.blockSignals(False)
-            bc = m.get("border_color", [180, 180, 180])
-            if isinstance(bc, (list, tuple)) and len(bc) == 3:
-                self.border_color_preview.setStyleSheet(
-                    f"background-color: rgb({int(bc[0])},{int(bc[1])},{int(bc[2])}); border: 1px solid #ccc;"
-                )
-        except Exception:
-            pass
+        # 注意：边框相关控件已移除，不再同步边框设置
 
     def _apply_selected_style(self):
         if self.selected_box and isinstance(self.selected_box, CanvasTextBox) and isinstance(self.selected_box.model, dict):
@@ -3914,7 +4178,7 @@ class PPTCloneApp(QMainWindow):
             initial = QColor(int(tc[0]), int(tc[1]), int(tc[2]))
         except Exception:
             initial = QColor(0, 0, 0)
-        color = QColorDialog.getColor(initial, self, "选择文字颜色")
+        color = QColorDialog.getColor(initial, self, self._t("选择文字颜色", "Choose text color"))
         if color.isValid():
             self.push_undo()
             m["text_color"] = [color.red(), color.green(), color.blue()]
@@ -3949,36 +4213,8 @@ class PPTCloneApp(QMainWindow):
         self._apply_selected_style()
         self._schedule_scene_rebuild()
 
-    def toggle_border(self, state):
-        m = self._get_selected_model()
-        if not m:
-            return
-        self.push_undo()
-        m["border_enabled"] = bool(state)
-        self._apply_selected_style()
-
-    def choose_border_color(self, *args):
-        m = self._get_selected_model()
-        if not m:
-            return
-        bc = m.get("border_color", [180, 180, 180])
-        try:
-            initial = QColor(int(bc[0]), int(bc[1]), int(bc[2]))
-        except Exception:
-            initial = QColor(180, 180, 180)
-        color = QColorDialog.getColor(initial, self, "选择边框颜色")
-        if color.isValid():
-            self.push_undo()
-            m["border_color"] = [color.red(), color.green(), color.blue()]
-            self.refresh_right_panel_from_selected()
-            self._apply_selected_style()
-
-    def on_border_width_changed(self, val):
-        m = self._get_selected_model()
-        if not m:
-            return
-        m["border_width"] = int(val)
-        self._apply_selected_style()
+    # 注意：边框相关方法 (toggle_border, choose_border_color, on_border_width_changed) 已移除
+    # 因为右侧面板中没有创建对应的边框控件
 
     def apply_style_to_current_slide(self, *args):
         """把当前选中文本框的样式批量应用到本页其他文本框（不改位置/文字）"""
@@ -4039,9 +4275,9 @@ class PPTCloneApp(QMainWindow):
                         removed = True
                         break
             if not removed:
-                print("删除文本框同步数据失败: 未在 box_data 中找到对应对象（可能已被删除/替换）")
+                logger.warning("删除文本框同步数据失败: 未在 box_data 中找到对应对象（可能已被删除/替换）")
         except Exception as e:
-            print(f"删除文本框同步数据失败: {e}")
+            logger.warning(f"删除文本框同步数据失败: {e}")
 
         # 从场景中删除
         self.scene.removeItem(self.selected_box)
@@ -4055,14 +4291,8 @@ class PPTCloneApp(QMainWindow):
         self.txt_edit.clear()
         self.txt_edit.blockSignals(False)
 
-        if hasattr(self, "chk_custom_bg"):
-            self.chk_custom_bg.blockSignals(True)
-            self.chk_custom_bg.setChecked(False)
-            self.chk_custom_bg.blockSignals(False)
-        if hasattr(self, "btn_choose_custom_color"):
-            self.btn_choose_custom_color.setEnabled(False)
-        if hasattr(self, "btn_pick_custom_color"):
-            self.btn_pick_custom_color.setEnabled(False)
+        # 重置右侧面板状态
+        self._reset_right_panel_state()
 
     def toggle_custom_bg(self, state):
         """切换自定义背景色"""
@@ -4088,7 +4318,7 @@ class PPTCloneApp(QMainWindow):
             self.chk_custom_bg.setChecked(True)
 
         initial_color = self.selected_box.custom_bg_color if self.selected_box.custom_bg_color else QColor(255, 255, 255)
-        color = QColorDialog.getColor(initial_color, self, "选择文本框背景色")
+        color = QColorDialog.getColor(initial_color, self, self._t("选择文本框背景色", "Choose background color"))
 
         if color.isValid():
             self.push_undo()
@@ -4125,7 +4355,11 @@ class PPTCloneApp(QMainWindow):
                 self.btn_eyedropper.blockSignals(False)
 
             self.view.setCursor(Qt.CrossCursor)
-            QMessageBox.information(self, "吸管工具", "点击画布上的任意位置取色（用于当前选中文本框）")
+            QMessageBox.information(
+                self,
+                self._t("吸管工具", "Eyedropper"),
+                self._t("点击画布上的任意位置取色（用于当前选中文本框）", "Click on the canvas to pick a color (for the selected box)."),
+            )
         else:
             self.picking_for_selected = False
             self.eyedropper_mode = False
@@ -4146,7 +4380,9 @@ class PPTCloneApp(QMainWindow):
         """Return a font size in pt using the same fitting routine as PPT export.
 
         This keeps the canvas preview closer to the final PPT appearance.
+        支持大尺寸图片（如 5504x3072 / 4K 截图），字体大小上限提高到 600pt。
         """
+        MAX_PT = 600
         try:
             w = max(1, int(round(float(box_w_px or 0))))
             h = max(1, int(round(float(box_h_px or 0))))
@@ -4158,24 +4394,108 @@ class PPTCloneApp(QMainWindow):
             self._ppt_exporter_metrics = PPTExporter(text_bg_color=None)
 
         try:
-            pt = self._ppt_exporter_metrics.fit_font_size(str(text or ""), w, h, dpi=96, padding_x=2, padding_y=2)
-            return int(max(6, min(200, int(round(float(pt))))))
+            pt = self._ppt_exporter_metrics.fit_font_size(
+                str(text or ""),
+                w,
+                h,
+                dpi=96,
+                padding_x=2,
+                padding_y=2,
+                max_pt=MAX_PT,
+            )
+            return int(max(6, min(MAX_PT, int(round(float(pt))))))
         except Exception:
             # Fallback: simple height-based estimate (still in pt at 96 DPI mapping).
-            est = int(round(max(6.0, min(200.0, (h * 72.0 / 96.0) * 0.8))))
+            est = int(round(max(6.0, min(float(MAX_PT), (h * 72.0 / 96.0) * 0.8))))
             return int(est)
+
+    def _prepare_boxes_for_ppt_export(self, image_path: str, boxes):
+        """Prepare a non-destructive copy of boxes for PPT export.
+
+        - Ensure auto font sizes are filled so slides not opened in the canvas still export correctly.
+        - Account for PPT's slide size cap (image may be scaled down when max dimension > 5000px).
+        """
+        src_boxes = boxes or []
+        if not isinstance(src_boxes, (list, tuple)) or not src_boxes:
+            return list(src_boxes) if isinstance(src_boxes, (list, tuple)) else []
+
+        # Mirror ppt_export.PPTExporter scaling logic (MAX_PPT_PIXELS).
+        MAX_PPT_PIXELS = 5000
+        ppt_scale = 1.0
+        try:
+            from PIL import Image
+
+            p = self._get_export_image_path(image_path)
+            with Image.open(p) as img:
+                img_w, img_h = img.size
+            max_dim = max(int(img_w or 0), int(img_h or 0))
+            if max_dim > MAX_PPT_PIXELS:
+                ppt_scale = float(MAX_PPT_PIXELS) / float(max_dim)
+        except Exception:
+            ppt_scale = 1.0
+
+        out = []
+        for item in src_boxes:
+            if not isinstance(item, dict):
+                out.append(item)
+                continue
+
+            m = copy.deepcopy(item)
+            rect = m.get("rect")
+            if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
+                out.append(m)
+                continue
+
+            try:
+                _, _, w, h = [float(v) for v in rect]
+            except Exception:
+                out.append(m)
+                continue
+
+            # Compute in the same "scaled slide" coordinate system as PPTExporter.
+            w_s = max(1, int(round(float(w) * float(ppt_scale))))
+            h_s = max(1, int(round(float(h) * float(ppt_scale))))
+
+            # If font_size is missing/invalid, or looks like it hit the old 200pt cap on a tall box,
+            # re-fit with the higher cap.
+            fs_raw = m.get("font_size")
+            try:
+                fs = int(fs_raw) if fs_raw is not None else None
+            except Exception:
+                fs = None
+
+            need_fit = fs is None
+            try:
+                # Heuristic: existing 200pt often means "capped" for big titles; only override when
+                # the box height clearly allows a much larger size.
+                if (not need_fit) and fs is not None and fs >= 200 and fs <= 205:
+                    h_pt_est = float(h_s) * 72.0 / 96.0
+                    if h_pt_est > (float(fs) + 30.0):
+                        need_fit = True
+            except Exception:
+                pass
+
+            if need_fit:
+                try:
+                    m["font_size"] = int(self.fit_font_size_pt_like_ppt(str(m.get("text") or ""), w_s, h_s))
+                except Exception:
+                    pass
+
+            out.append(m)
+
+        return out
 
     def export_ppt(self):
         """导出PPT"""
         if not self.images:
-            QMessageBox.warning(self, "提示", "请先导入图片")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
             return
 
         if not any(self.box_data.values()):
-            QMessageBox.warning(self, "提示", "请先运行OCR识别")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先运行OCR识别", "Please run OCR first."))
             return
 
-        save_path, _ = QFileDialog.getSaveFileName(self, "保存PPT", "", "PowerPoint (*.pptx)")
+        save_path, _ = QFileDialog.getSaveFileName(self, self._t("保存PPT", "Save PPT"), "", "PowerPoint (*.pptx)")
         if not save_path:
             return
 
@@ -4189,16 +4509,16 @@ class PPTCloneApp(QMainWindow):
                 exporter = PPTExporter(text_bg_color=None)
 
             for img_path in self.images:
-                boxes = self.box_data.get(img_path, [])
+                boxes = self._prepare_boxes_for_ppt_export(img_path, self.box_data.get(img_path, []))
                 exporter.add_image_with_text_boxes(self._get_export_image_path(img_path), boxes)
 
             if exporter.save(save_path):
-                QMessageBox.information(self, "成功", f"PPT已导出到:\n{save_path}")
+                QMessageBox.information(self, self._t("成功", "Success"), self._t(f"PPT已导出到:\n{save_path}", f"PPT exported to:\n{save_path}"))
             else:
-                QMessageBox.warning(self, "失败", "PPT导出失败")
+                QMessageBox.warning(self, self._t("失败", "Failed"), self._t("PPT导出失败", "Failed to export PPT."))
 
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
+            QMessageBox.critical(self, self._t("错误", "Error"), self._t(f"导出失败: {str(e)}", f"Export failed: {str(e)}"))
 
     def toggle_text_bg(self, state):
         """切换文本框背景色设置"""
@@ -4218,7 +4538,7 @@ class PPTCloneApp(QMainWindow):
                         self.slider_global_alpha.blockSignals(False)
             except Exception:
                 pass
-        print(f"文本框背景色: {'开启' if self.use_text_bg else '关闭'}")
+        logger.debug(f"文本框背景色: {'开启' if self.use_text_bg else '关闭'}")
         # 更新画布上所有文本框的背景色
         self.update_all_text_boxes_background()
 
@@ -4314,11 +4634,11 @@ class PPTCloneApp(QMainWindow):
 
     def pick_color(self):
         """打开颜色选择器"""
-        color = QColorDialog.getColor(self.text_bg_color, self, "选择文本框背景色")
+        color = QColorDialog.getColor(self.text_bg_color, self, self._t("选择文本框背景色", "Choose background color"))
         if color.isValid():
             self.text_bg_color = color
             self.update_color_preview()
-            print(f"选择颜色: RGB({color.red()}, {color.green()}, {color.blue()})")
+            logger.debug(f"选择颜色: RGB({color.red()}, {color.green()}, {color.blue()})")
             # 更新画布上所有文本框的背景色
             self.update_all_text_boxes_background()
 
@@ -4337,7 +4657,11 @@ class PPTCloneApp(QMainWindow):
                 pass
         if checked:
             self.view.setCursor(Qt.CrossCursor)
-            QMessageBox.information(self, "吸管工具", "点击画布上的任意位置取色")
+            QMessageBox.information(
+                self,
+                self._t("吸管工具", "Eyedropper"),
+                self._t("点击画布上的任意位置取色", "Click on the canvas to pick a color."),
+            )
         else:
             self.view.setCursor(Qt.ArrowCursor)
 
@@ -4362,8 +4686,8 @@ class PPTCloneApp(QMainWindow):
                         cur = cur.parentItem()
                     except Exception:
                         cur = None
-            print(f"已更新 {count} 个文本框的背景色")
-            self._force_canvas_redraw()
+        logger.debug(f"已更新 {count} 个文本框的背景色")
+        self._force_canvas_redraw()
 
     def _force_canvas_redraw(self):
         """强制整个画布重绘（用于解决透明度调整后偶发的“底图未刷新/消失”问题）"""
@@ -4590,13 +4914,13 @@ class PPTCloneApp(QMainWindow):
                                 self.chk_custom_bg.setChecked(True)
                                 self.update_custom_color_preview(picked_color)
                                 self.selected_box.update_background()
-                                print(f"为选中框吸管取色: RGB({r}, {g}, {b})")
+                                logger.debug(f"为选中框吸管取色: RGB({r}, {g}, {b})")
                             self.picking_for_selected = False
                         else:
                             # 全局颜色
                             self.text_bg_color = picked_color
                             self.update_color_preview()
-                            print(f"全局吸管取色: RGB({r}, {g}, {b})")
+                            logger.debug(f"全局吸管取色: RGB({r}, {g}, {b})")
 
                             # 自动启用背景色
                             if not self.use_text_bg:
@@ -4621,16 +4945,16 @@ class PPTCloneApp(QMainWindow):
                         self.eyedropper_mode = False
                         self.view.setCursor(Qt.ArrowCursor)
             except Exception as e:
-                print(f"吸管取色失败: {e}")
+                logger.warning(f"吸管取色失败: {e}")
 
     def preview_ppt(self):
         """预览导出PPT"""
         if not self.images:
-            QMessageBox.warning(self, "提示", "请先导入图片")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
             return
 
         if not any(self.box_data.values()):
-            QMessageBox.warning(self, "提示", "请先运行OCR识别")
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先运行OCR识别", "Please run OCR first."))
             return
 
         try:
@@ -4651,7 +4975,7 @@ class PPTCloneApp(QMainWindow):
                 exporter = PPTExporter(text_bg_color=None)
 
             for img_path in self.images:
-                boxes = self.box_data.get(img_path, [])
+                boxes = self._prepare_boxes_for_ppt_export(img_path, self.box_data.get(img_path, []))
                 exporter.add_image_with_text_boxes(self._get_export_image_path(img_path), boxes)
 
             if exporter.save(temp_path):
@@ -4700,18 +5024,32 @@ class PPTCloneApp(QMainWindow):
                     opened = True
 
                 if opened:
-                    QMessageBox.information(self, "成功", "PPT预览已打开\n\n注意：这是临时文件，本程序退出时会尝试删除（若被 Office 占用可能无法立即删除）")
+                    QMessageBox.information(
+                        self,
+                        self._t("成功", "Success"),
+                        self._t(
+                            "PPT预览已打开\n\n注意：这是临时文件，本程序退出时会尝试删除（若被 Office 占用可能无法立即删除）",
+                            "Preview opened.\n\nNote: this is a temporary file. The app will try to delete it on exit (it may fail if Office is still using it).",
+                        ),
+                    )
                 else:
-                    QMessageBox.warning(self, "提示", f"PPT 已生成，但打开失败：{temp_path}\n你可以手动打开该文件。")
+                    QMessageBox.warning(
+                        self,
+                        self._t("提示", "Info"),
+                        self._t(
+                            f"PPT 已生成，但打开失败：{temp_path}\n你可以手动打开该文件。",
+                            f"PPT was generated but failed to open: {temp_path}\nYou can open it manually.",
+                        ),
+                    )
             else:
-                QMessageBox.warning(self, "失败", "PPT预览生成失败")
+                QMessageBox.warning(self, self._t("失败", "Failed"), self._t("PPT预览生成失败", "Failed to generate preview PPT."))
 
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"预览失败: {str(e)}")
+            QMessageBox.critical(self, self._t("错误", "Error"), self._t(f"预览失败: {str(e)}", f"Preview failed: {str(e)}"))
 
     def update_status(self):
         cnt = len(self.images); row = (self.list_thumb.currentRow() + 1) if cnt > 0 else 0
-        self.lbl_page.setText(f"幻灯片 {row} / {cnt}")
+        self.lbl_page.setText(self._t(f"幻灯片 {row} / {cnt}", f"Slide {row} / {cnt}"))
 
     def _cleanup_preview_ppts(self):
         """尝试删除已经不再被 Office 占用的预览临时 PPT 文件"""
@@ -4796,7 +5134,26 @@ class PPTCloneApp(QMainWindow):
         super().closeEvent(event)
 
 if __name__ == "__main__":
+    # 配置日志格式
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
+
     app = QApplication(sys.argv)
+
+    # 检查依赖
+    if _missing_qtawesome:
+        QMessageBox.critical(
+            None,
+            _t_sys("缺少库", "Missing dependency"),
+            _t_sys("请运行 pip install qtawesome", "Please run: pip install qtawesome"),
+        )
+        sys.exit(1)
+
     win = PPTCloneApp()
     win.show()
     sys.exit(app.exec())
