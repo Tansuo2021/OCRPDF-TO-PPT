@@ -30,7 +30,37 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# === Windows: suppress console flash from OCR deps (subprocess spawned during import/init) ===
+# ==================== 常量定义 ====================
+# 图像处理
+TARGET_IMAGE_HEIGHT = 1080          # 缩放目标高度
+MAX_PPT_PIXELS = 5000               # PPT导出最大像素
+
+# 字体大小
+FONT_SIZE_MIN = 6                   # 最小字号
+FONT_SIZE_MAX = 600                 # 最大字号
+
+# 透明度
+DEFAULT_BG_ALPHA = 120              # 默认背景透明度
+ALPHA_MIN = 0                       # 透明度最小值
+ALPHA_MAX = 255                     # 透明度最大值
+
+# 缩放
+ZOOM_MIN = 10                       # 缩放最小值 (%)
+ZOOM_MAX = 400                      # 缩放最大值 (%)
+
+# IOPaint 参数
+BOX_PADDING_DEFAULT = 5             # 默认框内边距
+BOX_PADDING_MAX = 200               # 框内边距最大值
+CROP_PADDING_DEFAULT = 50           # 默认裁剪边距
+CROP_PADDING_MAX = 2000             # 裁剪边距最大值
+
+# 临时文件清理
+PREVIEW_FILE_MIN_AGE_SEC = 600      # 预览文件最小保留时间（秒）
+
+# 场景重建延迟
+SCENE_REBUILD_DELAY_MS = 80         # 场景重建延迟（毫秒）
+
+# ==================== Windows 控制台抑制 ====================
 @contextlib.contextmanager
 def suppress_windows_subprocess_console():
     """Temporarily hide console windows spawned via subprocess on Windows.
@@ -286,6 +316,169 @@ GLOBAL_STYLE = f"""
     }}
 """
 
+# ==================== 文字颜色提取工具 ====================
+
+def extract_text_color_from_region(image, rect_xywh, sample_ratio=0.3):
+    """
+    从图片指定区域提取文字的主要颜色（支持所有颜色）。
+
+    算法思路：
+    1. 裁剪文本框区域
+    2. 使用 K-Means 聚类找出主要颜色（通常2-3种：背景+文字+可能的边缘）
+    3. 背景通常是面积最大的颜色，文字是第二大或与背景对比度最高的颜色
+    4. 如果 K-Means 失败，回退到边缘检测 + 颜色采样
+
+    Args:
+        image: numpy array (BGR格式) 或图片路径
+        rect_xywh: [x, y, w, h] 文本框坐标
+        sample_ratio: 采样比例，用于加速处理
+
+    Returns:
+        [r, g, b] 文字颜色，如果提取失败返回 None
+    """
+    try:
+        # 如果是路径，读取图片
+        if isinstance(image, str):
+            image = cv2.imread(image)
+        if image is None:
+            return None
+
+        x, y, w, h = [int(v) for v in rect_xywh]
+        H, W = image.shape[:2]
+
+        # 边界检查
+        x = max(0, min(x, W - 1))
+        y = max(0, min(y, H - 1))
+        w = max(1, min(w, W - x))
+        h = max(1, min(h, H - y))
+
+        # 裁剪区域
+        crop = image[y:y+h, x:x+w]
+        if crop.size == 0:
+            return None
+
+        # 尝试使用 K-Means 方法
+        result = _extract_color_kmeans(crop)
+        if result is not None:
+            return result
+
+        # 回退到边缘检测方法
+        result = _extract_color_edge_based(crop)
+        if result is not None:
+            return result
+
+        # 最后回退到 Otsu 方法
+        return _extract_color_otsu(crop)
+
+    except Exception as e:
+        logger.debug(f"提取文字颜色失败: {e}")
+        return None
+
+
+def _extract_color_kmeans(crop, n_clusters=3):
+    """使用 K-Means 聚类提取文字颜色"""
+    try:
+        h, w = crop.shape[:2]
+        pixels = crop.reshape(-1, 3).astype(np.float32)
+
+        # 采样加速
+        if len(pixels) > 5000:
+            indices = np.random.choice(len(pixels), 5000, replace=False)
+            pixels = pixels[indices]
+
+        # K-Means 聚类
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+        _, labels, centers = cv2.kmeans(
+            pixels, n_clusters, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+        )
+
+        # 统计每个簇的像素数量
+        unique, counts = np.unique(labels, return_counts=True)
+        sorted_idx = np.argsort(-counts)  # 按数量降序
+
+        # 背景通常是最大的簇
+        bg_idx = sorted_idx[0]
+        bg_color = centers[bg_idx]
+
+        # 找与背景对比度最高的颜色作为文字颜色
+        best_text_idx = None
+        best_contrast = 0
+
+        for idx in sorted_idx[1:]:
+            color = centers[idx]
+            # 计算颜色对比度（欧氏距离）
+            contrast = np.sqrt(np.sum((color - bg_color) ** 2))
+            if contrast > best_contrast:
+                best_contrast = contrast
+                best_text_idx = idx
+
+        if best_text_idx is None or best_contrast < 30:
+            return None
+
+        text_color = centers[best_text_idx].astype(int)
+        # BGR -> RGB
+        return [int(text_color[2]), int(text_color[1]), int(text_color[0])]
+
+    except Exception:
+        return None
+
+
+def _extract_color_edge_based(crop):
+    """使用边缘检测提取文字颜色（文字边缘通常有明显的颜色）"""
+    try:
+        # Canny 边缘检测
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+
+        # 膨胀边缘以获取更多文字像素
+        kernel = np.ones((3, 3), np.uint8)
+        dilated = cv2.dilate(edges, kernel, iterations=1)
+
+        # 获取边缘附近的像素颜色
+        edge_pixels = crop[dilated > 0]
+        if len(edge_pixels) < 10:
+            return None
+
+        # 采样
+        if len(edge_pixels) > 1000:
+            indices = np.random.choice(len(edge_pixels), 1000, replace=False)
+            edge_pixels = edge_pixels[indices]
+
+        # 中位数颜色
+        median_color = np.median(edge_pixels, axis=0).astype(int)
+        return [int(median_color[2]), int(median_color[1]), int(median_color[0])]
+
+    except Exception:
+        return None
+
+
+def _extract_color_otsu(crop):
+    """使用 Otsu 阈值分割提取文字颜色（回退方法）"""
+    try:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        white_pixels = np.sum(binary == 255)
+        black_pixels = np.sum(binary == 0)
+
+        # 文字通常占少数像素
+        mask = binary == 255 if white_pixels < black_pixels else binary == 0
+
+        text_pixels = crop[mask]
+        if len(text_pixels) == 0:
+            return None
+
+        if len(text_pixels) > 1000:
+            indices = np.random.choice(len(text_pixels), 1000, replace=False)
+            text_pixels = text_pixels[indices]
+
+        median_color = np.median(text_pixels, axis=0).astype(int)
+        return [int(median_color[2]), int(median_color[1]), int(median_color[0])]
+
+    except Exception:
+        return None
+
+
 # ==================== 核心组件封装 ====================
 
 class OCRThread(QThread):
@@ -379,8 +572,10 @@ class OCRThread(QThread):
                             except Exception:
                                 pass
                             base = os.path.splitext(os.path.basename(img_path))[0]
+                            # 清理文件名中的特殊字符，防止路径注入
+                            safe_base = re.sub(r'[^\w\-.]', '_', base)
                             ts = int(time.time() * 1000)
-                            crop_path = os.path.join(out_dir, f"roi_ocr_{base}_{ts}_{xs}_{ys}_{ws}x{hs}.png")
+                            crop_path = os.path.join(out_dir, f"roi_ocr_{safe_base}_{ts}_{xs}_{ys}_{ws}x{hs}.png")
                             cv2.imwrite(crop_path, crop)
 
                             results = self.ocr_engine.recognize(crop_path) or []
@@ -443,7 +638,9 @@ class OCRRoiThread(QThread):
 
             crop = img[y : y + h, x : x + w]
             base = os.path.splitext(os.path.basename(self.image_path))[0]
-            out_path = os.path.join(self.out_dir, f"roi_ocr_{base}_{x}_{y}_{w}x{h}.png")
+            # 清理文件名中的特殊字符，防止路径注入
+            safe_base = re.sub(r'[^\w\-.]', '_', base)
+            out_path = os.path.join(self.out_dir, f"roi_ocr_{safe_base}_{x}_{y}_{w}x{h}.png")
             cv2.imwrite(out_path, crop)
 
             results = self.ocr_engine.recognize(out_path) or []
@@ -759,7 +956,9 @@ class InpaintThread(QThread):
 
                 ts = int(time.time())
                 base = os.path.splitext(os.path.basename(src))[0]
-                out_path = os.path.join(self.out_dir, f"inpaint_{base}_{ts}.png")
+                # 清理文件名中的特殊字符，防止路径注入
+                safe_base = re.sub(r'[^\w\-.]', '_', base)
+                out_path = os.path.join(self.out_dir, f"inpaint_{safe_base}_{ts}.png")
                 final.save(out_path, "PNG")
 
                 self.results.append((src, out_path))
@@ -946,16 +1145,16 @@ class CustomGraphicsView(QGraphicsView):
                     return p.toPoint()  # QPointF -> QPoint
                 except Exception:
                     return p
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"获取事件位置(position)失败: {e}")
         # Fallback: Qt5-style pos()
         try:
             v = getattr(event, "pos", None)
             if v is not None:
                 p = v() if callable(v) else v
                 return p
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"获取事件位置(pos)失败: {e}")
         return QPoint(0, 0)
 
     def mousePressEvent(self, event):
@@ -967,8 +1166,8 @@ class CustomGraphicsView(QGraphicsView):
                 self.setCursor(Qt.ClosedHandCursor)
                 event.accept()
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"处理中键按下事件失败: {e}")
 
         # ROI selection mode: drag a rectangle to set OCR/inpaint region
         try:
@@ -976,8 +1175,8 @@ class CustomGraphicsView(QGraphicsView):
                 self.parent_win.canvas_roi_press(event)
                 event.accept()
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"处理ROI选择按下事件失败: {e}")
 
         # 如果是吸管模式，调用取色函数
         if self.parent_win.eyedropper_mode:
@@ -1032,15 +1231,15 @@ class CustomGraphicsView(QGraphicsView):
                 self.setCursor(Qt.CrossCursor if getattr(self.parent_win, "eyedropper_mode", False) else Qt.ArrowCursor)
                 event.accept()
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"处理中键释放事件失败: {e}")
         try:
             if getattr(self.parent_win, "roi_select_mode", False) and event.button() == Qt.LeftButton:
                 self.parent_win.canvas_roi_release(event)
                 event.accept()
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"处理ROI选择释放事件失败: {e}")
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
@@ -1062,12 +1261,12 @@ class CustomGraphicsView(QGraphicsView):
                 self.scale(factor, factor)
                 try:
                     self.parent_win._update_zoom_label()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"更新缩放标签失败: {e}")
                 event.accept()
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"处理滚轮缩放事件失败: {e}")
         super().wheelEvent(event)
 
 class CanvasTextBox(QGraphicsItemGroup):
@@ -1096,7 +1295,7 @@ class CanvasTextBox(QGraphicsItemGroup):
         self.custom_bg_color = None
         self.use_custom_bg = False
         # 默认做得更透明一点，避免开启背景色后“整张图像看不见”
-        self.bg_alpha = 120
+        self.bg_alpha = DEFAULT_BG_ALPHA
         if self.model is not None:
             self.use_custom_bg = bool(self.model.get("use_custom_bg", False))
             bg = self.model.get("bg_color")
@@ -1108,7 +1307,7 @@ class CanvasTextBox(QGraphicsItemGroup):
             try:
                 self.bg_alpha = int(self.model.get("bg_alpha", 120))
             except Exception:
-                self.bg_alpha = 120
+                self.bg_alpha = DEFAULT_BG_ALPHA
 
         # 确保rect可以正确解包
         if isinstance(rect, dict):
@@ -1496,7 +1695,7 @@ class PPTCloneApp(QMainWindow):
         # 拖动透明度滑块时，Qt 偶发出现“底图不重绘”。用一个短延迟的重建作为兜底（不会频繁重建）。
         self._scene_rebuild_timer = QTimer(self)
         self._scene_rebuild_timer.setSingleShot(True)
-        self._scene_rebuild_timer.setInterval(80)
+        self._scene_rebuild_timer.setInterval(SCENE_REBUILD_DELAY_MS)
         self._scene_rebuild_timer.timeout.connect(self._rebuild_scene_keep_view)
 
         # OCR 引擎延迟初始化（首次识别才加载）
@@ -1507,7 +1706,7 @@ class PPTCloneApp(QMainWindow):
         self.use_text_bg = True  # 是否使用文本框背景色
         self.text_bg_color = QColor(255, 255, 255)  # 默认白色背景
         # 默认透明度降低一些，避免在画布上遮住原图；导出前可在“视图-背景透明度”调高
-        self.text_bg_alpha = 120
+        self.text_bg_alpha = DEFAULT_BG_ALPHA
         self._user_set_global_bg_alpha = False
         self.eyedropper_mode = False  # 吸管模式
         self._ppt_exporter_metrics = None  # lazy, for fit_font_size used by canvas preview
@@ -1950,13 +2149,13 @@ class PPTCloneApp(QMainWindow):
         form.addRow(self._t("IOPaint API 地址", "IOPaint API URL"), ed_url)
 
         sp_box_pad = QSpinBox()
-        sp_box_pad.setRange(0, 200)
+        sp_box_pad.setRange(0, BOX_PADDING_MAX)
         sp_box_pad.setValue(int(self.settings.get("inpaint_box_padding", 6) or 6))
         sp_box_pad.setSuffix(" px")
         form.addRow(self._t("文本框外扩（遮罩）", "Box padding (mask)"), sp_box_pad)
 
         sp_crop_pad = QSpinBox()
-        sp_crop_pad.setRange(0, 2000)
+        sp_crop_pad.setRange(0, CROP_PADDING_MAX)
         sp_crop_pad.setValue(int(self.settings.get("inpaint_crop_padding", 128) or 128))
         sp_crop_pad.setSuffix(" px")
         form.addRow(self._t("裁剪外扩（API加速）", "Crop padding (API speed-up)"), sp_crop_pad)
@@ -2693,7 +2892,7 @@ class PPTCloneApp(QMainWindow):
         alpha_lbl.setStyleSheet("font-size: 12px;")
         alpha_layout.addWidget(alpha_lbl)
         self.slider_global_alpha = QSlider(Qt.Horizontal)
-        self.slider_global_alpha.setRange(0, 255)
+        self.slider_global_alpha.setRange(ALPHA_MIN, ALPHA_MAX)
         self.slider_global_alpha.setToolTip(self._t("0=不透明，255=全透明", "0 = opaque, 255 = transparent"))
         try:
             self.slider_global_alpha.setValue(255 - int(getattr(self, "text_bg_alpha", 120)))
@@ -2701,6 +2900,7 @@ class PPTCloneApp(QMainWindow):
             self.slider_global_alpha.setValue(135)
         self.slider_global_alpha.valueChanged.connect(self.on_global_bg_alpha_changed)
         self.slider_global_alpha.sliderPressed.connect(self.push_undo)
+        self.slider_global_alpha.sliderReleased.connect(self._schedule_scene_rebuild)  # 释放时重建场景
         self.slider_global_alpha.setFixedWidth(130)
         alpha_layout.addWidget(self.slider_global_alpha)
         alpha_layout.addStretch()
@@ -2908,7 +3108,7 @@ class PPTCloneApp(QMainWindow):
         sb_layout.addWidget(btn_fit)
         
         self.zoom_slider = QSlider(Qt.Horizontal)
-        self.zoom_slider.setRange(10, 400)
+        self.zoom_slider.setRange(ZOOM_MIN, ZOOM_MAX)
         self.zoom_slider.setValue(100)
         self.zoom_slider.setFixedWidth(130)
         self.zoom_slider.setCursor(Qt.PointingHandCursor)
@@ -2976,7 +3176,7 @@ class PPTCloneApp(QMainWindow):
         """)
         # PPT title text can easily exceed 72pt (e.g. 1080p/4K slides). Keep the UI range large enough
         # so selecting a big box doesn't clamp the value to the slider max.
-        self.slider_font.setRange(6, 600)
+        self.slider_font.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
         self.slider_font.setValue(12)
         self.slider_font.valueChanged.connect(self.on_font_size_changed)
         self.slider_font.sliderPressed.connect(self.push_undo)
@@ -3068,12 +3268,13 @@ class PPTCloneApp(QMainWindow):
 
         l.addWidget(QLabel(self._t("背景透明度:", "BG transparency:")))
         self.slider_bg_alpha = QSlider(Qt.Horizontal)
-        self.slider_bg_alpha.setRange(0, 255)
+        self.slider_bg_alpha.setRange(ALPHA_MIN, ALPHA_MAX)
         self.slider_bg_alpha.setToolTip(self._t("0=不透明，255=全透明", "0 = opaque, 255 = transparent"))
         # UI 透明度：255-alpha
         self.slider_bg_alpha.setValue(135)
         self.slider_bg_alpha.valueChanged.connect(self.on_bg_alpha_changed)
         self.slider_bg_alpha.sliderPressed.connect(self.push_undo)
+        self.slider_bg_alpha.sliderReleased.connect(self._schedule_scene_rebuild)  # 释放时重建场景
         self.slider_bg_alpha.setEnabled(False)
         l.addWidget(self.slider_bg_alpha)
         l.addSpacing(10)
@@ -3124,7 +3325,12 @@ class PPTCloneApp(QMainWindow):
                     continue
 
                 h, w = img.shape[:2]
-                target_h = 1080
+                target_h = TARGET_IMAGE_HEIGHT
+
+                # 防止除零：高度为0的图片跳过
+                if h <= 0 or w <= 0:
+                    self.scaled_images[original_path] = original_path
+                    continue
 
                 # 如果图片高度已经接近1080p，不需要缩放
                 if abs(h - target_h) < 100:
@@ -3132,7 +3338,7 @@ class PPTCloneApp(QMainWindow):
                     continue
 
                 # 计算缩放比例
-                scale = target_h / h
+                scale = target_h / max(1, h)
                 new_w = int(w * scale)
                 new_h = target_h
 
@@ -3380,11 +3586,15 @@ class PPTCloneApp(QMainWindow):
             timeout_sec=120,
         )
         progress.canceled.connect(self.inpaint_thread.requestInterruption)
-        self.inpaint_thread.progress.connect(lambda cur, total: progress.setValue(cur))
+        # 显式使用 QueuedConnection 确保跨线程信号在主线程中处理
+        self.inpaint_thread.progress.connect(lambda cur, total: progress.setValue(cur), Qt.QueuedConnection)
 
         # Collect replacements
         self._inpaint_replacements = []
-        self.inpaint_thread.finished_one.connect(lambda src, dst: self._inpaint_replacements.append((src, dst)))
+        self.inpaint_thread.finished_one.connect(
+            lambda src, dst: self._inpaint_replacements.append((src, dst)),
+            Qt.QueuedConnection
+        )
 
         def on_error(msg: str):
             try:
@@ -3415,8 +3625,8 @@ class PPTCloneApp(QMainWindow):
                     self._t("已取消 IOPaint 去字", "IOPaint canceled."),
                 )
 
-        self.inpaint_thread.error.connect(on_error)
-        self.inpaint_thread.all_done.connect(on_done)
+        self.inpaint_thread.error.connect(on_error, Qt.QueuedConnection)
+        self.inpaint_thread.all_done.connect(on_done, Qt.QueuedConnection)
         self.inpaint_thread.start()
 
     def run_ocr_simulation(self, images=None):
@@ -3465,9 +3675,13 @@ class PPTCloneApp(QMainWindow):
             roi_temp_dir=getattr(self, "temp_dir", None),
         )
         progress.canceled.connect(self.ocr_thread.requestInterruption)
-        self.ocr_thread.finished.connect(lambda img, results, roi: self.on_ocr_result(img, results, roi))
-        self.ocr_thread.progress.connect(lambda cur, total: progress.setValue(cur))
-        self.ocr_thread.all_done.connect(progress.close)
+        # 显式使用 QueuedConnection 确保跨线程信号在主线程中处理
+        self.ocr_thread.finished.connect(
+            lambda img, results, roi: self.on_ocr_result(img, results, roi),
+            Qt.QueuedConnection
+        )
+        self.ocr_thread.progress.connect(lambda cur, total: progress.setValue(cur), Qt.QueuedConnection)
+        self.ocr_thread.all_done.connect(progress.close, Qt.QueuedConnection)
         self.ocr_thread.start()
 
     def run_ocr_current_slide(self):
@@ -3773,9 +3987,9 @@ class PPTCloneApp(QMainWindow):
                 orig_h, orig_w = original_img.shape[:2]
                 scaled_h, scaled_w = scaled_img.shape[:2]
 
-                # 计算缩放比例
-                scale_x = orig_w / scaled_w
-                scale_y = orig_h / scaled_h
+                # 计算缩放比例（防止除零）
+                scale_x = orig_w / max(1, scaled_w)
+                scale_y = orig_h / max(1, scaled_h)
 
                 # 还原坐标
                 for result in results:
@@ -3792,6 +4006,13 @@ class PPTCloneApp(QMainWindow):
                             ]
 
         # 初始化每个文本框的可编辑字段（用于后续：移动/改字/自定义背景色/删除）
+        # 读取原图用于提取文字颜色
+        original_img = None
+        try:
+            original_img = cv2.imread(image_path)
+        except Exception as e:
+            logger.debug(f"读取原图用于颜色提取失败: {e}")
+
         for r in results:
             if isinstance(r, dict):
                 r.setdefault("use_custom_bg", False)
@@ -3801,7 +4022,12 @@ class PPTCloneApp(QMainWindow):
                 r.setdefault("font_size", None)  # pt（None=自动）
                 r.setdefault("bold", False)
                 r.setdefault("align", "left")  # left/center/right
-                r.setdefault("text_color", [0, 0, 0])
+
+                # 自动提取文字颜色
+                extracted_color = None
+                if original_img is not None and "rect" in r:
+                    extracted_color = extract_text_color_from_region(original_img, r["rect"])
+                r.setdefault("text_color", extracted_color if extracted_color else [0, 0, 0])
 
         # ROI OCR：只更新选区内的文本框，保留选区外用户已调整过的框。
         merged = results
@@ -4202,6 +4428,7 @@ class PPTCloneApp(QMainWindow):
         self._apply_selected_style()
 
     def on_bg_alpha_changed(self, val):
+        """单个文本框透明度 - 拖动时轻量更新，释放时重建"""
         m = self._get_selected_model()
         if not m:
             return
@@ -4209,9 +4436,14 @@ class PPTCloneApp(QMainWindow):
         try:
             m["bg_alpha"] = max(0, min(255, 255 - int(val)))
         except Exception:
-            m["bg_alpha"] = 120
+            m["bg_alpha"] = DEFAULT_BG_ALPHA
         self._apply_selected_style()
-        self._schedule_scene_rebuild()
+
+        # 只有在非拖动状态时才触发场景重建
+        if not (hasattr(self, "slider_bg_alpha") and
+                self.slider_bg_alpha and
+                self.slider_bg_alpha.isSliderDown()):
+            self._schedule_scene_rebuild()
 
     # 注意：边框相关方法 (toggle_border, choose_border_color, on_border_width_changed) 已移除
     # 因为右侧面板中没有创建对应的边框控件
@@ -4382,7 +4614,7 @@ class PPTCloneApp(QMainWindow):
         This keeps the canvas preview closer to the final PPT appearance.
         支持大尺寸图片（如 5504x3072 / 4K 截图），字体大小上限提高到 600pt。
         """
-        MAX_PT = 600
+        MAX_PT = FONT_SIZE_MAX
         try:
             w = max(1, int(round(float(box_w_px or 0))))
             h = max(1, int(round(float(box_h_px or 0))))
@@ -4420,7 +4652,6 @@ class PPTCloneApp(QMainWindow):
             return list(src_boxes) if isinstance(src_boxes, (list, tuple)) else []
 
         # Mirror ppt_export.PPTExporter scaling logic (MAX_PPT_PIXELS).
-        MAX_PPT_PIXELS = 5000
         ppt_scale = 1.0
         try:
             from PIL import Image
@@ -4530,7 +4761,7 @@ class PPTCloneApp(QMainWindow):
         if (not prev) and self.use_text_bg and (not getattr(self, "_user_set_global_bg_alpha", False)):
             try:
                 if int(getattr(self, "text_bg_alpha", 120)) > 160:
-                    self.text_bg_alpha = 120
+                    self.text_bg_alpha = DEFAULT_BG_ALPHA
                     if hasattr(self, "slider_global_alpha"):
                         self.slider_global_alpha.blockSignals(True)
                         # UI 透明度：255-alpha
@@ -4543,15 +4774,22 @@ class PPTCloneApp(QMainWindow):
         self.update_all_text_boxes_background()
 
     def on_global_bg_alpha_changed(self, val):
-        """全局背景透明度（0-255）"""
+        """全局背景透明度（0-255）- 拖动时轻量更新，释放时重建"""
         try:
             # UI val=透明度(0=不透明,255=全透明) -> alpha(0=全透明,255=不透明)
             self.text_bg_alpha = max(0, min(255, 255 - int(val)))
         except Exception:
             self.text_bg_alpha = 200
         self._user_set_global_bg_alpha = True
+
+        # 拖动中：只更新文本框背景，不重建场景（避免卡顿）
         self.update_all_text_boxes_background()
-        self._schedule_scene_rebuild()
+
+        # 只有在非拖动状态时才触发场景重建
+        if not (hasattr(self, "slider_global_alpha") and
+                self.slider_global_alpha and
+                self.slider_global_alpha.isSliderDown()):
+            self._schedule_scene_rebuild()
 
     def _schedule_scene_rebuild(self):
         """短延迟兜底：重建当前页场景，修复透明度拖动时偶发的底图消失/不刷新。"""
@@ -5055,7 +5293,7 @@ class PPTCloneApp(QMainWindow):
         """尝试删除已经不再被 Office 占用的预览临时 PPT 文件"""
         import time
         # 先保留一段时间，避免 Office 还没来得及打开就被删掉（会导致“文件不存在”）
-        MIN_AGE_SEC = 10 * 60
+        MIN_AGE_SEC = PREVIEW_FILE_MIN_AGE_SEC
 
         items = getattr(self, "_temp_preview_ppts", {}) or {}
         if not isinstance(items, dict):
@@ -5087,6 +5325,15 @@ class PPTCloneApp(QMainWindow):
         self._temp_preview_ppts = keep
 
     def closeEvent(self, event):
+        # 停止正在运行的线程，避免访问已销毁的对象
+        for th_name in ("ocr_thread", "inpaint_thread"):
+            th = getattr(self, th_name, None)
+            if th is not None and th.isRunning():
+                logger.debug(f"正在停止线程: {th_name}")
+                th.requestInterruption()
+                if not th.wait(3000):  # 等待最多3秒
+                    logger.warning(f"线程 {th_name} 未能在3秒内停止")
+
         # 尽量清理预览产生的临时文件（无法保证在 Office 仍占用时删除成功）
         try:
             self._cleanup_preview_ppts()
