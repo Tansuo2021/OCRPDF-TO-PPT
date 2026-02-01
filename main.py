@@ -318,6 +318,143 @@ GLOBAL_STYLE = f"""
 
 # ==================== 文字颜色提取工具 ====================
 
+def _imread_any(path: str):
+    """Robust cv2 image read that also works for non-ASCII Windows paths."""
+    try:
+        p = str(path or "")
+        if not p:
+            return None
+        # cv2.imread may fail on Windows for Unicode paths; fromfile+imdecode works.
+        try:
+            data = np.fromfile(p, dtype=np.uint8)
+            if data is not None and data.size > 0:
+                img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if img is not None:
+                    return img
+        except Exception:
+            pass
+        return cv2.imread(p)
+    except Exception:
+        return None
+
+
+def _srgb_to_linear(c):
+    c = float(c)
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
+
+
+def _rgb_to_lab(rgb):
+    """Convert sRGB [0..255] to CIE Lab (D65). Returns (L,a,b) floats."""
+    r, g, b = [max(0.0, min(255.0, float(v))) / 255.0 for v in rgb]
+    r = _srgb_to_linear(r)
+    g = _srgb_to_linear(g)
+    b = _srgb_to_linear(b)
+
+    # sRGB -> XYZ (D65)
+    x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
+    y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
+    z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
+
+    # Normalize by reference white (D65)
+    xr = x / 0.95047
+    yr = y / 1.00000
+    zr = z / 1.08883
+
+    def f(t):
+        if t > 0.008856:
+            return t ** (1.0 / 3.0)
+        return (7.787 * t) + (16.0 / 116.0)
+
+    fx = f(xr)
+    fy = f(yr)
+    fz = f(zr)
+
+    L = (116.0 * fy) - 16.0
+    a = 500.0 * (fx - fy)
+    b = 200.0 * (fy - fz)
+    return (L, a, b)
+
+
+def _ciede2000(lab1, lab2):
+    """CIEDE2000 color difference for two Lab triples."""
+    import math
+
+    L1, a1, b1 = [float(v) for v in lab1]
+    L2, a2, b2 = [float(v) for v in lab2]
+
+    avg_L = (L1 + L2) / 2.0
+    C1 = math.hypot(a1, b1)
+    C2 = math.hypot(a2, b2)
+    avg_C = (C1 + C2) / 2.0
+
+    # G factor
+    C7 = avg_C ** 7
+    G = 0.5 * (1.0 - math.sqrt(C7 / (C7 + (25.0 ** 7))) if (C7 + (25.0 ** 7)) != 0 else 0.0)
+    a1p = (1.0 + G) * a1
+    a2p = (1.0 + G) * a2
+    C1p = math.hypot(a1p, b1)
+    C2p = math.hypot(a2p, b2)
+    avg_Cp = (C1p + C2p) / 2.0
+
+    def hp(ap, b):
+        if ap == 0 and b == 0:
+            return 0.0
+        h = math.degrees(math.atan2(b, ap))
+        return h + 360.0 if h < 0 else h
+
+    h1p = hp(a1p, b1)
+    h2p = hp(a2p, b2)
+
+    dLp = L2 - L1
+    dCp = C2p - C1p
+
+    dhp = h2p - h1p
+    if C1p * C2p == 0:
+        dHp = 0.0
+    else:
+        if dhp > 180.0:
+            dhp -= 360.0
+        elif dhp < -180.0:
+            dhp += 360.0
+        dHp = 2.0 * math.sqrt(C1p * C2p) * math.sin(math.radians(dhp / 2.0))
+
+    # Average hue
+    if C1p * C2p == 0:
+        avg_hp = h1p + h2p
+    else:
+        if abs(h1p - h2p) > 180.0:
+            avg_hp = (h1p + h2p + 360.0) / 2.0 if (h1p + h2p) < 360.0 else (h1p + h2p - 360.0) / 2.0
+        else:
+            avg_hp = (h1p + h2p) / 2.0
+
+    T = (
+        1.0
+        - 0.17 * math.cos(math.radians(avg_hp - 30.0))
+        + 0.24 * math.cos(math.radians(2.0 * avg_hp))
+        + 0.32 * math.cos(math.radians(3.0 * avg_hp + 6.0))
+        - 0.20 * math.cos(math.radians(4.0 * avg_hp - 63.0))
+    )
+
+    d_ro = 30.0 * math.exp(-(((avg_hp - 275.0) / 25.0) ** 2))
+    Rc = 2.0 * math.sqrt((avg_Cp ** 7) / ((avg_Cp ** 7) + (25.0 ** 7))) if avg_Cp != 0 else 0.0
+    Sl = 1.0 + (0.015 * ((avg_L - 50.0) ** 2)) / math.sqrt(20.0 + ((avg_L - 50.0) ** 2))
+    Sc = 1.0 + 0.045 * avg_Cp
+    Sh = 1.0 + 0.015 * avg_Cp * T
+    Rt = -math.sin(math.radians(2.0 * d_ro)) * Rc
+
+    # Parametric factors
+    Kl = Kc = Kh = 1.0
+    dE = math.sqrt(
+        (dLp / (Kl * Sl)) ** 2
+        + (dCp / (Kc * Sc)) ** 2
+        + (dHp / (Kh * Sh)) ** 2
+        + Rt * (dCp / (Kc * Sc)) * (dHp / (Kh * Sh))
+    )
+    return float(dE)
+
+
 def extract_text_color_from_region(image, rect_xywh, sample_ratio=0.3):
     """
     从图片指定区域提取文字的主要颜色（支持所有颜色）。
@@ -339,7 +476,7 @@ def extract_text_color_from_region(image, rect_xywh, sample_ratio=0.3):
     try:
         # 如果是路径，读取图片
         if isinstance(image, str):
-            image = cv2.imread(image)
+            image = _imread_any(image)
         if image is None:
             return None
 
@@ -357,6 +494,11 @@ def extract_text_color_from_region(image, rect_xywh, sample_ratio=0.3):
         if crop.size == 0:
             return None
 
+        # 先用“背景/前景”法（对“白字黑描边/阴影”等更稳），失败再回退到 K-Means/边缘/OTSU
+        result = _extract_color_bg_foreground(crop)
+        if result is not None:
+            return result
+
         # 尝试使用 K-Means 方法
         result = _extract_color_kmeans(crop)
         if result is not None:
@@ -373,6 +515,41 @@ def extract_text_color_from_region(image, rect_xywh, sample_ratio=0.3):
     except Exception as e:
         logger.debug(f"提取文字颜色失败: {e}")
         return None
+
+
+def quantize_text_color_basic(rgb):
+    """将任意 RGB 颜色量化为常见基础色（用于 PPT 文本颜色），并返回 (rgb, name_zh)。
+
+    使用 CIEDE2000（Lab 感知距离）在固定调色板中选最近颜色，比简单 HSV 区间更稳。
+    """
+    try:
+        if not (isinstance(rgb, (list, tuple)) and len(rgb) == 3):
+            return (None, None)
+        r, g, b = [int(max(0, min(255, v))) for v in rgb]
+
+        palette = [
+            ([0, 0, 0], "黑"),
+            ([255, 255, 255], "白"),
+            ([255, 0, 0], "红"),
+            ([255, 165, 0], "橙"),
+            ([255, 255, 0], "黄"),
+            ([0, 255, 0], "绿"),
+            ([0, 255, 255], "青"),
+            ([0, 0, 255], "蓝"),
+            ([128, 0, 255], "紫"),
+        ]
+
+        lab = _rgb_to_lab([r, g, b])
+        best = None
+        best_d = None
+        for prgb, name in palette:
+            d = _ciede2000(lab, _rgb_to_lab(prgb))
+            if best_d is None or d < best_d:
+                best_d = d
+                best = (prgb, name)
+        return best if best is not None else (None, None)
+    except Exception:
+        return (None, None)
 
 
 def _extract_color_kmeans(crop, n_clusters=3):
@@ -447,6 +624,111 @@ def _extract_color_edge_based(crop):
         # 中位数颜色
         median_color = np.median(edge_pixels, axis=0).astype(int)
         return [int(median_color[2]), int(median_color[1]), int(median_color[0])]
+
+    except Exception:
+        return None
+
+
+def _extract_color_bg_foreground(crop):
+    """基于“边缘背景估计 -> 前景分割 ->（可选）腐蚀去描边”的文字颜色提取。
+
+    目的：解决“白字黑描边/阴影”场景，避免只取到描边的黑色。
+    """
+    try:
+        h, w = crop.shape[:2]
+        if h <= 2 or w <= 2:
+            return None
+
+        # 1) 估计背景色：取边缘像素的中位数（更稳，避免被文字覆盖）
+        t = max(1, int(round(min(h, w) * 0.08)))  # ~8% border
+        t = min(t, max(1, min(h, w) // 3))
+        top = crop[:t, :, :]
+        bot = crop[-t:, :, :]
+        lef = crop[:, :t, :]
+        rig = crop[:, -t:, :]
+        border = np.concatenate(
+            [top.reshape(-1, 3), bot.reshape(-1, 3), lef.reshape(-1, 3), rig.reshape(-1, 3)],
+            axis=0,
+        )
+        if border.size == 0:
+            return None
+        bg_bgr = np.median(border, axis=0).astype(np.float32)
+
+        # 2) 用 Lab 距离做前景分割（比 RGB 更符合感知）
+        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+        bg_bgr_u8 = np.uint8([[np.clip(bg_bgr, 0, 255)]])
+        bg_lab = cv2.cvtColor(bg_bgr_u8, cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
+        d = lab - bg_lab  # (h,w,3)
+        dist = np.sqrt(np.sum(d * d, axis=2))  # (h,w)
+
+        # 自适应阈值：对不同背景纹理/压缩噪声更稳
+        thr = 18.0
+        try:
+            dmin = float(np.min(dist))
+            dmax = float(np.max(dist))
+            if dmax > dmin + 1e-6:
+                norm = np.uint8(np.clip((dist - dmin) * (255.0 / (dmax - dmin)), 0, 255))
+                # Otsu on distances (as 8-bit) -> map back to float threshold.
+                thr_u8, _ = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                thr = dmin + (float(thr_u8) / 255.0) * (dmax - dmin)
+                thr = float(max(10.0, min(35.0, thr)))
+        except Exception:
+            thr = 18.0
+
+        fg = (dist >= thr).astype(np.uint8) * 255
+
+        # 3) 轻微形态学清理
+        kernel = np.ones((3, 3), np.uint8)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # 4) 距离变换取“核心像素”：更数学化地去掉描边/阴影/抗锯齿边缘，只保留填充内部
+        core = None
+        try:
+            dt = cv2.distanceTransform(fg, cv2.DIST_L2, 3)
+            maxd = float(np.max(dt)) if dt is not None else 0.0
+            if maxd > 0:
+                core_thr = max(0.8, maxd * 0.55)
+                core = np.uint8(dt >= core_thr) * 255
+        except Exception:
+            core = None
+
+        def _pick_color_from_mask(mask):
+            pts = crop[mask > 0]
+            if pts is None or len(pts) < 20:
+                return None
+            if len(pts) > 5000:
+                idx = np.random.choice(len(pts), 5000, replace=False)
+                pts = pts[idx]
+
+            # 2-cluster to separate fill vs outline/shadow when both remain.
+            pixels = pts.astype(np.float32)
+            if len(pixels) < 50:
+                med = np.median(pixels, axis=0).astype(int)
+                return [int(med[2]), int(med[1]), int(med[0])]
+
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+            _, labels, centers = cv2.kmeans(pixels, 2, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+            labels = labels.reshape(-1)
+            cnt0 = int(np.sum(labels == 0))
+            cnt1 = int(np.sum(labels == 1))
+
+            # Prefer the larger cluster; if close, prefer the one further from bg.
+            c0 = centers[0]
+            c1 = centers[1]
+            d0 = float(np.linalg.norm(c0 - bg_bgr))
+            d1 = float(np.linalg.norm(c1 - bg_bgr))
+            if abs(cnt0 - cnt1) <= max(10, int(0.08 * max(cnt0, cnt1))):
+                pick = 0 if d0 >= d1 else 1
+            else:
+                pick = 0 if cnt0 >= cnt1 else 1
+            c = centers[pick].astype(int)
+            return [int(c[2]), int(c[1]), int(c[0])]
+
+        # Prefer core pixels (best for outlined/shadowed text). If too small, fall back to full foreground.
+        col = _pick_color_from_mask(core) if core is not None else None
+        if col is not None:
+            return col
+        return _pick_color_from_mask(fg)
 
     except Exception:
         return None
@@ -4025,10 +4307,10 @@ class PPTCloneApp(QMainWindow):
                             ]
 
         # 初始化每个文本框的可编辑字段（用于后续：移动/改字/自定义背景色/删除）
-        # 读取原图用于提取文字颜色
+        # 读取原图用于提取文字颜色（用更稳的读取方式，兼容 Windows 非 ASCII 路径）
         original_img = None
         try:
-            original_img = cv2.imread(image_path)
+            original_img = _imread_any(image_path)
         except Exception as e:
             logger.debug(f"读取原图用于颜色提取失败: {e}")
 
@@ -4046,7 +4328,32 @@ class PPTCloneApp(QMainWindow):
                 extracted_color = None
                 if original_img is not None and "rect" in r:
                     extracted_color = extract_text_color_from_region(original_img, r["rect"])
-                r.setdefault("text_color", extracted_color if extracted_color else [0, 0, 0])
+                if extracted_color:
+                    q_rgb, q_name = quantize_text_color_basic(extracted_color)
+                    # Keep a record of the raw color for debugging/tuning.
+                    r.setdefault("text_color_raw", extracted_color)
+                    if q_rgb:
+                        r.setdefault("text_color", q_rgb)
+                        r.setdefault("text_color_name", q_name)
+                        try:
+                            key_map = {
+                                "黑": "black",
+                                "白": "white",
+                                "红": "red",
+                                "橙": "orange",
+                                "黄": "yellow",
+                                "绿": "green",
+                                "青": "cyan",
+                                "蓝": "blue",
+                                "紫": "purple",
+                            }
+                            r.setdefault("text_color_key", key_map.get(str(q_name), None))
+                        except Exception:
+                            pass
+                    else:
+                        r.setdefault("text_color", extracted_color)
+                else:
+                    r.setdefault("text_color", [0, 0, 0])
 
         # ROI OCR：只更新选区内的文本框，保留选区外用户已调整过的框。
         merged = results
