@@ -487,6 +487,7 @@ class OCRThread(QThread):
     finished = Signal(str, list, object)
     progress = Signal(int, int)   # (current, total)
     all_done = Signal()           # emitted once when the run loop ends
+    error = Signal(str)           # emitted on first fatal OCR error
 
     def __init__(self, ocr_engine, images, scaled_images, roi_by_image=None, roi_temp_dir=None):
         super().__init__()
@@ -598,7 +599,15 @@ class OCRThread(QThread):
                     # Fall back to full-image OCR below.
                     pass
 
-            results = self.ocr_engine.recognize(scaled_path)
+            try:
+                results = self.ocr_engine.recognize(scaled_path)
+            except Exception as e:
+                # Avoid "Error calling Python override of QThread::run()" and let the UI show the error.
+                try:
+                    self.error.emit(f"OCR 识别失败: {os.path.basename(scaled_path)}\n{type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                break
             self.finished.emit(img_path, results, None)
             self.progress.emit(i + 1, len(self.images))
         self.all_done.emit()
@@ -1905,6 +1914,12 @@ class PPTCloneApp(QMainWindow):
             logger.warning(f"保存设置失败: {e}")
 
     def _apply_ocr_env(self):
+        # Work around a PaddlePaddle OneDNN + PIR limitation that can raise:
+        # NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support [...]
+        # Disabling OneDNN is the most reliable fix on Windows/CPU.
+        os.environ["FLAGS_use_mkldnn"] = "0"
+        os.environ["FLAGS_use_onednn"] = "0"
+
         cache_dir = (self.settings.get("ocr_paddlex_home") or "").strip()
         if not cache_dir:
             # 默认放到项目目录，方便拷贝到其他电脑
@@ -3682,6 +3697,10 @@ class PPTCloneApp(QMainWindow):
         )
         self.ocr_thread.progress.connect(lambda cur, total: progress.setValue(cur), Qt.QueuedConnection)
         self.ocr_thread.all_done.connect(progress.close, Qt.QueuedConnection)
+        self.ocr_thread.error.connect(
+            lambda msg: (progress.close(), QMessageBox.critical(self, self._t("OCR错误", "OCR Error"), msg)),
+            Qt.QueuedConnection,
+        )
         self.ocr_thread.start()
 
     def run_ocr_current_slide(self):

@@ -13,6 +13,12 @@ import numpy as np
 # 静默 Paddle 输出
 os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("FLAGS_minloglevel", "2")
+
+# Some PaddleOCR 3.x models use PIR. On Windows/CPU, enabling OneDNN can hit a
+# PaddlePaddle limitation and crash with:
+# NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support [...]
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("FLAGS_use_onednn", "0")
 warnings.filterwarnings("ignore")
 
 try:
