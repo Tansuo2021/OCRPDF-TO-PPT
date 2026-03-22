@@ -1,4 +1,5 @@
 PySide6>=6.5.0
+qtawesome>=1.4.1
 paddleocr>=2.7.0
 paddlepaddle>=2.5.0
 opencv-python>=4.8.0

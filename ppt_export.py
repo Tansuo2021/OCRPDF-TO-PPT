@@ -2,7 +2,7 @@
 PPT导出功能 - 可编辑文本版本
 """
 from pptx import Presentation
-from pptx.util import Inches, Pt, Emu
+from pptx.util import Pt
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor
 from pptx.oxml.ns import qn
@@ -15,14 +15,17 @@ class PPTExporter:
 
     # 96 DPI: 1px = 914400 / 96 = 9525 EMU
     PIXELS_TO_EMU = 9525
+    MAX_PPT_PIXELS = 5000
 
-    def __init__(self, text_bg_color=None, text_bg_alpha=200):
+    def __init__(self, text_bg_color=None, text_bg_alpha=200, slide_size_px=None, allow_upscale=False):
         """
         初始化PPT
 
         Args:
             text_bg_color: 文本框背景颜色 (R, G, B) 或 None（无背景）
             text_bg_alpha: 文本框背景不透明度 0-255（仅 text_bg_color 不为 None 时生效）
+            slide_size_px: 固定幻灯片尺寸 (width_px, height_px)。混合尺寸导出时应预先传入。
+            allow_upscale: 当图片小于固定幻灯片尺寸时，是否放大填充。
         """
         self.prs = Presentation()
         self.text_bg_color = text_bg_color  # 例如: (255, 255, 255) 白色
@@ -31,6 +34,86 @@ class PPTExporter:
         except Exception:
             self.text_bg_alpha = 200
         self.dimensions_set = False  # 标记是否已设置尺寸
+        self.slide_size_px = self._normalize_slide_size(slide_size_px)
+        self.allow_upscale = bool(allow_upscale)
+
+    @classmethod
+    def _scale_to_ppt_limit(cls, img_width, img_height):
+        img_width = max(1, int(img_width or 1))
+        img_height = max(1, int(img_height or 1))
+        max_dimension = max(img_width, img_height)
+        if max_dimension > cls.MAX_PPT_PIXELS:
+            ppt_scale = cls.MAX_PPT_PIXELS / max_dimension
+            scaled_width = max(1, int(round(img_width * ppt_scale)))
+            scaled_height = max(1, int(round(img_height * ppt_scale)))
+        else:
+            ppt_scale = 1.0
+            scaled_width = img_width
+            scaled_height = img_height
+        return scaled_width, scaled_height, float(ppt_scale)
+
+    @classmethod
+    def presentation_size_for_images(cls, image_paths):
+        max_w = 1
+        max_h = 1
+        for image_path in image_paths or []:
+            try:
+                with Image.open(image_path) as img:
+                    scaled_w, scaled_h, _ = cls._scale_to_ppt_limit(*img.size)
+                max_w = max(max_w, scaled_w)
+                max_h = max(max_h, scaled_h)
+            except Exception:
+                continue
+        return max_w, max_h
+
+    def _normalize_slide_size(self, slide_size_px):
+        if not (isinstance(slide_size_px, (list, tuple)) and len(slide_size_px) == 2):
+            return None
+        try:
+            w = max(1, int(round(float(slide_size_px[0]))))
+            h = max(1, int(round(float(slide_size_px[1]))))
+        except Exception:
+            return None
+        return (w, h)
+
+    def _resolve_slide_layout(self, img_width, img_height):
+        scaled_width, scaled_height, ppt_scale = self._scale_to_ppt_limit(img_width, img_height)
+        slide_w, slide_h = self.slide_size_px or (scaled_width, scaled_height)
+
+        layout_scale = min(float(slide_w) / float(scaled_width), float(slide_h) / float(scaled_height))
+        if not self.allow_upscale:
+            layout_scale = min(1.0, layout_scale)
+        layout_scale = max(layout_scale, 1e-6)
+
+        placed_w = max(1, int(round(float(scaled_width) * layout_scale)))
+        placed_h = max(1, int(round(float(scaled_height) * layout_scale)))
+        left = max(0, int(round((float(slide_w) - float(placed_w)) / 2.0)))
+        top = max(0, int(round((float(slide_h) - float(placed_h)) / 2.0)))
+
+        return {
+            "slide_width": int(slide_w),
+            "slide_height": int(slide_h),
+            "image_width": placed_w,
+            "image_height": placed_h,
+            "left": left,
+            "top": top,
+            "ppt_scale": float(ppt_scale),
+            "layout_scale": float(layout_scale),
+            "content_scale": float(ppt_scale) * float(layout_scale),
+        }
+
+    def _ensure_slide_dimensions(self, slide_w, slide_h):
+        pixels_to_emu = self.PIXELS_TO_EMU
+        if not self.dimensions_set:
+            self.prs.slide_width = int(slide_w * pixels_to_emu)
+            self.prs.slide_height = int(slide_h * pixels_to_emu)
+            self.dimensions_set = True
+            return
+
+        current_w = int(round(self.prs.slide_width / pixels_to_emu))
+        current_h = int(round(self.prs.slide_height / pixels_to_emu))
+        if current_w != int(slide_w) or current_h != int(slide_h):
+            raise RuntimeError("PPT slide size is already fixed. Pass a shared slide_size_px before adding slides.")
 
     def _rect_to_xywh(self, rect, img_w, img_h):
         """
@@ -102,35 +185,19 @@ class PPTExporter:
             return
 
         pixels_to_emu = self.PIXELS_TO_EMU
+        layout = self._resolve_slide_layout(img_width, img_height)
+        self._ensure_slide_dimensions(layout["slide_width"], layout["slide_height"])
+        if layout["ppt_scale"] != 1.0:
+            print(
+                f"[INFO] 图片尺寸超过PPT限制，缩放: {img_width}x{img_height} -> "
+                f"{int(round(img_width * layout['ppt_scale']))}x{int(round(img_height * layout['ppt_scale']))} "
+                f"(比例: {layout['ppt_scale']:.4f})"
+            )
 
-        # PowerPoint限制：最大56英寸 = 51206400 EMU
-        # 按96 DPI计算：51206400 / 9525 ≈ 5376 像素
-        # 为了安全，我们设置最大5000像素
-        MAX_PPT_PIXELS = 5000
-        ppt_scale = 1.0
-
-        # 检查是否需要缩放以适应PPT限制
-        max_dimension = max(img_width, img_height)
-        if max_dimension > MAX_PPT_PIXELS:
-            ppt_scale = MAX_PPT_PIXELS / max_dimension
-            scaled_width = int(img_width * ppt_scale)
-            scaled_height = int(img_height * ppt_scale)
-            print(f"[INFO] 图片尺寸超过PPT限制，缩放: {img_width}x{img_height} -> {scaled_width}x{scaled_height} (比例: {ppt_scale:.4f})")
-        else:
-            scaled_width = img_width
-            scaled_height = img_height
-
-        # 设置PPT页面大小为缩放后的图片大小（仅第一次设置）
-        if not self.dimensions_set:
-            self.prs.slide_width = int(scaled_width * pixels_to_emu)
-            self.prs.slide_height = int(scaled_height * pixels_to_emu)
-            self.dimensions_set = True
-
-        # 图片填充整个页面（左上角对齐）
-        img_left = 0
-        img_top = 0
-        ppt_img_width = int(scaled_width * pixels_to_emu)
-        ppt_img_height = int(scaled_height * pixels_to_emu)
+        img_left = int(layout["left"] * pixels_to_emu)
+        img_top = int(layout["top"] * pixels_to_emu)
+        ppt_img_width = int(layout["image_width"] * pixels_to_emu)
+        ppt_img_height = int(layout["image_height"] * pixels_to_emu)
 
         # 添加图片
         try:
@@ -153,12 +220,11 @@ class PPTExporter:
             # 直接使用传入的坐标（已经在主程序中还原过了）
             x, y, w, h = self._rect_to_xywh(rect, img_width, img_height)
 
-            # 如果PPT进行了缩放，需要同步缩放文本框坐标
-            if ppt_scale != 1.0:
-                x = int(x * ppt_scale)
-                y = int(y * ppt_scale)
-                w = int(w * ppt_scale)
-                h = int(h * ppt_scale)
+            content_scale = float(layout["content_scale"])
+            x = int(round(float(x) * content_scale)) + int(layout["left"])
+            y = int(round(float(y) * content_scale)) + int(layout["top"])
+            w = max(1, int(round(float(w) * content_scale)))
+            h = max(1, int(round(float(h) * content_scale)))
 
             text = item.get('text', "")
 
@@ -216,10 +282,12 @@ class PPTExporter:
                 except Exception:
                     font_size = None
             if font_size is None:
-                # 计算字体大小，并应用 0.88 的缩小系数
+                # 计算字体大小，并应用额外缩小系数
                 # 因为 PPT 的文本渲染引擎与画布预览不同，实际显示会偏大
                 calculated_size = self.fit_font_size(text, w, h, padding_x=2, padding_y=2)
-                font_size = int(calculated_size * 0.70)  # 缩小 12% 以匹配画布预览
+                font_size = int(calculated_size * 0.70)
+            elif layout["layout_scale"] != 1.0:
+                font_size = max(1, int(round(float(font_size) * float(layout["layout_scale"]))))
             p.font.size = Pt(int(font_size))
 
             print(f"    文本框尺寸: {w}x{h}px, 字体: {font_size}pt")

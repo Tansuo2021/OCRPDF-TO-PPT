@@ -27,13 +27,13 @@ from PySide6.QtGui import (
 )
 import cv2
 import numpy as np
+from image_utils import build_asset_path, imread_any, imwrite_any
 
 logger = logging.getLogger(__name__)
 
 # ==================== 常量定义 ====================
 # 图像处理
 TARGET_IMAGE_HEIGHT = 1080          # 缩放目标高度
-MAX_PPT_PIXELS = 5000               # PPT导出最大像素
 
 # 字体大小
 FONT_SIZE_MIN = 6                   # 最小字号
@@ -212,6 +212,14 @@ try:
     from ppt_export import PPTExporter
 except ImportError:
     class PPTExporter:
+        @classmethod
+        def _scale_to_ppt_limit(cls, img_width, img_height):
+            return int(img_width or 1), int(img_height or 1), 1.0
+
+        @classmethod
+        def presentation_size_for_images(cls, image_paths):
+            return 1, 1
+
         def __init__(self, **kwargs): pass
         def add_image_with_text_boxes(self, *args): pass
         def save(self, path): return True
@@ -320,22 +328,12 @@ GLOBAL_STYLE = f"""
 
 def _imread_any(path: str):
     """Robust cv2 image read that also works for non-ASCII Windows paths."""
-    try:
-        p = str(path or "")
-        if not p:
-            return None
-        # cv2.imread may fail on Windows for Unicode paths; fromfile+imdecode works.
-        try:
-            data = np.fromfile(p, dtype=np.uint8)
-            if data is not None and data.size > 0:
-                img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                if img is not None:
-                    return img
-        except Exception:
-            pass
-        return cv2.imread(p)
-    except Exception:
-        return None
+    return imread_any(path)
+
+
+def _imwrite_any(path: str, image, params=None) -> bool:
+    """Robust cv2 image write that also works for non-ASCII Windows paths."""
+    return imwrite_any(path, image, params=params)
 
 
 def _srgb_to_linear(c):
@@ -494,7 +492,12 @@ def extract_text_color_from_region(image, rect_xywh, sample_ratio=0.3):
         if crop.size == 0:
             return None
 
-        # 先用“背景/前景”法（对“白字黑描边/阴影”等更稳），失败再回退到 K-Means/边缘/OTSU
+        # 先用“背景估计 + 前景核心像素”法，优先抓文字主体，避免被抗锯齿边缘/阴影/表格线带偏。
+        result = _extract_color_core_contrast(crop)
+        if result is not None:
+            return result
+
+        # 再用“背景/前景”法（对“白字黑描边/阴影”等也较稳），失败再回退到 K-Means/边缘/OTSU
         result = _extract_color_bg_foreground(crop)
         if result is not None:
             return result
@@ -550,6 +553,54 @@ def quantize_text_color_basic(rgb):
         return best if best is not None else (None, None)
     except Exception:
         return (None, None)
+
+
+def normalize_box_text_color_fields(box):
+    """Prefer the raw extracted text color; keep palette color only as metadata."""
+    if not isinstance(box, dict):
+        return
+    raw = box.get("text_color_raw")
+    if not (isinstance(raw, (list, tuple)) and len(raw) == 3):
+        return
+    raw_rgb = [int(max(0, min(255, v))) for v in raw]
+    q_rgb, q_name = quantize_text_color_basic(raw_rgb)
+    current = box.get("text_color")
+    current_rgb = None
+    if isinstance(current, (list, tuple)) and len(current) == 3:
+        current_rgb = [int(max(0, min(255, v))) for v in current]
+
+    # Migrate older OCR results that stored only the quantized color in text_color.
+    if current_rgb is None or current_rgb == raw_rgb or (q_rgb and current_rgb == [int(v) for v in q_rgb]):
+        box["text_color"] = list(raw_rgb)
+
+    if q_rgb:
+        box.setdefault("text_color_quantized", [int(v) for v in q_rgb])
+        box.setdefault("text_color_name", q_name)
+        try:
+            key_map = {
+                "黑": "black",
+                "白": "white",
+                "红": "red",
+                "橙": "orange",
+                "黄": "yellow",
+                "绿": "green",
+                "青": "cyan",
+                "蓝": "blue",
+                "紫": "purple",
+            }
+            box.setdefault("text_color_key", key_map.get(str(q_name), None))
+        except Exception:
+            pass
+
+
+def should_auto_refresh_text_color(box):
+    if not isinstance(box, dict):
+        return False
+    if "text_color_auto" in box:
+        return bool(box.get("text_color_auto", False))
+    if bool(box.get("text_color_manual", False)):
+        return False
+    return any(k in box for k in ("text_color_raw", "text_color_quantized", "text_color_key", "text_color_name"))
 
 
 def _extract_color_kmeans(crop, n_clusters=3):
@@ -629,6 +680,155 @@ def _extract_color_edge_based(crop):
         return None
 
 
+def _estimate_border_bg_bgr(crop):
+    try:
+        h, w = crop.shape[:2]
+        if h <= 1 or w <= 1:
+            return None
+        t = max(1, int(round(min(h, w) * 0.08)))
+        t = min(t, max(1, min(h, w) // 3))
+        top = crop[:t, :, :]
+        bot = crop[-t:, :, :]
+        lef = crop[:, :t, :]
+        rig = crop[:, -t:, :]
+        border = np.concatenate(
+            [top.reshape(-1, 3), bot.reshape(-1, 3), lef.reshape(-1, 3), rig.reshape(-1, 3)],
+            axis=0,
+        )
+        if border.size == 0:
+            return None
+        return np.median(border.astype(np.float32), axis=0).astype(np.float32)
+    except Exception:
+        return None
+
+
+def _suppress_long_lines(mask_u8):
+    try:
+        mask = (np.asarray(mask_u8, dtype=np.uint8) > 0).astype(np.uint8)
+        if not mask.any():
+            return mask_u8
+        h, w = mask.shape[:2]
+        if h < 6 or w < 6:
+            return (mask * 255).astype(np.uint8)
+
+        line_mask = np.zeros_like(mask, dtype=np.uint8)
+        row_fill = mask.mean(axis=1)
+        col_fill = mask.mean(axis=0)
+
+        row_idx = np.where(row_fill >= 0.60)[0]
+        col_idx = np.where(col_fill >= 0.60)[0]
+        if row_idx.size:
+            line_mask[row_idx, :] = 1
+        if col_idx.size:
+            line_mask[:, col_idx] = 1
+
+        if line_mask.any():
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            line_mask = cv2.dilate(line_mask * 255, kernel, iterations=1)
+            cleaned = mask.copy()
+            cleaned[line_mask > 0] = 0
+            if int(cleaned.sum()) >= max(12, int(mask.sum() * 0.08)):
+                return (cleaned * 255).astype(np.uint8)
+        return (mask * 255).astype(np.uint8)
+    except Exception:
+        return mask_u8
+
+
+def _extract_color_core_contrast(crop):
+    """基于背景对比与文字核心像素提取颜色。
+
+    目标：
+    - 黑字/白字优先提取到真正的字芯，而不是浅灰抗锯齿边缘
+    - 表格页里尽量忽略横线/竖线
+    - 仍保留有色文字的识别能力
+    """
+    try:
+        h, w = crop.shape[:2]
+        if h <= 2 or w <= 2:
+            return None
+
+        bg_bgr = _estimate_border_bg_bgr(crop)
+        if bg_bgr is None:
+            return None
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+        bg_bgr_u8 = np.uint8([[np.clip(bg_bgr, 0, 255)]])
+        bg_lab = cv2.cvtColor(bg_bgr_u8, cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
+        dist = np.sqrt(np.sum((lab - bg_lab) * (lab - bg_lab), axis=2))
+
+        dmin = float(np.min(dist))
+        dmax = float(np.max(dist))
+        if dmax <= dmin + 1e-6:
+            return None
+
+        norm = np.uint8(np.clip((dist - dmin) * (255.0 / (dmax - dmin)), 0, 255))
+        thr_u8, _ = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thr = dmin + (float(thr_u8) / 255.0) * (dmax - dmin)
+        thr = float(max(10.0, min(42.0, thr)))
+
+        fg = (dist >= thr).astype(np.uint8) * 255
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+        fg = _suppress_long_lines(fg)
+        fg_bool = fg > 0
+        if int(fg_bool.sum()) < 12:
+            return None
+
+        bg_luma = float(0.114 * float(bg_bgr[0]) + 0.587 * float(bg_bgr[1]) + 0.299 * float(bg_bgr[2]))
+        delta = gray - bg_luma
+        dark_strength = float(np.sum(np.clip(-delta[fg_bool], 0.0, None)))
+        light_strength = float(np.sum(np.clip(delta[fg_bool], 0.0, None)))
+        prefer_dark = bool(dark_strength >= light_strength)
+
+        fg_vals = gray[fg_bool]
+        lum_margin = max(10.0, float(np.std(fg_vals)) * 0.35 + 6.0) if fg_vals.size else 10.0
+        if prefer_dark:
+            polarity_mask = fg_bool & (gray <= (bg_luma - lum_margin))
+            if int(polarity_mask.sum()) < max(8, int(fg_bool.sum() * 0.06)):
+                polarity_mask = fg_bool & (gray <= (bg_luma - 4.0))
+        else:
+            polarity_mask = fg_bool & (gray >= (bg_luma + lum_margin))
+            if int(polarity_mask.sum()) < max(8, int(fg_bool.sum() * 0.06)):
+                polarity_mask = fg_bool & (gray >= (bg_luma + 4.0))
+
+        chosen_mask = polarity_mask if int(polarity_mask.sum()) >= 8 else fg_bool
+        if int(chosen_mask.sum()) < 8:
+            return None
+
+        core_mask = chosen_mask
+        dt = cv2.distanceTransform((chosen_mask.astype(np.uint8) * 255), cv2.DIST_L2, 3)
+        maxd = float(np.max(dt)) if dt is not None else 0.0
+        if maxd > 1.0:
+            cand_core = dt >= max(1.0, maxd * 0.30)
+            if int(cand_core.sum()) >= max(6, int(chosen_mask.sum() * 0.05)):
+                core_mask = cand_core
+
+        ys, xs = np.nonzero(core_mask)
+        if len(xs) < 6:
+            ys, xs = np.nonzero(chosen_mask)
+        if len(xs) < 6:
+            return None
+
+        pixels = crop[ys, xs].astype(np.float32)
+        pix_gray = gray[ys, xs]
+        pix_dist = dist[ys, xs]
+        if prefer_dark:
+            polarity_strength = np.clip(bg_luma - pix_gray, 0.0, None)
+        else:
+            polarity_strength = np.clip(pix_gray - bg_luma, 0.0, None)
+        weights = np.maximum(pix_dist, 1.0) * np.power(np.maximum(polarity_strength, 1.0), 1.15)
+        if weights.size >= 8:
+            keep_thr = float(np.percentile(weights, 55))
+            keep = weights >= keep_thr
+            if int(np.count_nonzero(keep)) >= 6:
+                pixels = pixels[keep]
+
+        vals = np.median(pixels, axis=0).astype(int)
+        return [int(vals[2]), int(vals[1]), int(vals[0])]
+    except Exception:
+        return None
+
+
 def _extract_color_bg_foreground(crop):
     """基于“边缘背景估计 -> 前景分割 ->（可选）腐蚀去描边”的文字颜色提取。
 
@@ -692,13 +892,23 @@ def _extract_color_bg_foreground(crop):
         except Exception:
             core = None
 
-        def _pick_color_from_mask(mask):
+        def _bgr_luma(c):
+            try:
+                return float(0.114 * float(c[0]) + 0.587 * float(c[1]) + 0.299 * float(c[2]))
+            except Exception:
+                return 0.0
+
+        def _pick_color_from_mask(mask, prefer_core=False):
             pts = crop[mask > 0]
             if pts is None or len(pts) < 20:
                 return None
             if len(pts) > 5000:
                 idx = np.random.choice(len(pts), 5000, replace=False)
                 pts = pts[idx]
+
+            if prefer_core:
+                med = np.median(pts.astype(np.float32), axis=0).astype(int)
+                return [int(med[2]), int(med[1]), int(med[0])]
 
             # 2-cluster to separate fill vs outline/shadow when both remain.
             pixels = pts.astype(np.float32)
@@ -712,20 +922,31 @@ def _extract_color_bg_foreground(crop):
             cnt0 = int(np.sum(labels == 0))
             cnt1 = int(np.sum(labels == 1))
 
-            # Prefer the larger cluster; if close, prefer the one further from bg.
+            # Prefer the cluster that is more opposite to the background, while still
+            # giving some weight to coverage so tiny noise doesn't win.
             c0 = centers[0]
             c1 = centers[1]
             d0 = float(np.linalg.norm(c0 - bg_bgr))
             d1 = float(np.linalg.norm(c1 - bg_bgr))
-            if abs(cnt0 - cnt1) <= max(10, int(0.08 * max(cnt0, cnt1))):
-                pick = 0 if d0 >= d1 else 1
-            else:
-                pick = 0 if cnt0 >= cnt1 else 1
+            bg_luma = _bgr_luma(bg_bgr)
+            l0 = _bgr_luma(c0)
+            l1 = _bgr_luma(c1)
+            max_cnt = max(1, cnt0, cnt1)
+
+            def _score(dist, cnt, lum):
+                score = float(dist) * 1.4 + abs(float(lum) - bg_luma) * 0.45 + (float(cnt) / float(max_cnt)) * 6.0
+                if bg_luma >= 170.0:
+                    score += max(0.0, bg_luma - float(lum)) * 0.30
+                elif bg_luma <= 85.0:
+                    score += max(0.0, float(lum) - bg_luma) * 0.30
+                return score
+
+            pick = 0 if _score(d0, cnt0, l0) >= _score(d1, cnt1, l1) else 1
             c = centers[pick].astype(int)
             return [int(c[2]), int(c[1]), int(c[0])]
 
         # Prefer core pixels (best for outlined/shadowed text). If too small, fall back to full foreground.
-        col = _pick_color_from_mask(core) if core is not None else None
+        col = _pick_color_from_mask(core, prefer_core=True) if core is not None else None
         if col is not None:
             return col
         return _pick_color_from_mask(fg)
@@ -825,9 +1046,9 @@ class OCRThread(QThread):
                     roi_orig = [x, y, w, h]
 
                 try:
-                    img = cv2.imread(scaled_path)
+                    img = _imread_any(scaled_path)
                     if img is None:
-                        img = cv2.imread(img_path)
+                        img = _imread_any(img_path)
                         scaled_path = img_path
                     if img is not None and x is not None:
                         Hs, Ws = img.shape[:2]
@@ -854,12 +1075,16 @@ class OCRThread(QThread):
                                 os.makedirs(out_dir, exist_ok=True)
                             except Exception:
                                 pass
-                            base = os.path.splitext(os.path.basename(img_path))[0]
-                            # 清理文件名中的特殊字符，防止路径注入
-                            safe_base = re.sub(r'[^\w\-.]', '_', base)
                             ts = int(time.time() * 1000)
-                            crop_path = os.path.join(out_dir, f"roi_ocr_{safe_base}_{ts}_{xs}_{ys}_{ws}x{hs}.png")
-                            cv2.imwrite(crop_path, crop)
+                            crop_path = build_asset_path(
+                                out_dir,
+                                "roi_ocr",
+                                img_path,
+                                suffix=f"{ts}_{xs}_{ys}_{ws}x{hs}",
+                                ext=".png",
+                            )
+                            if not _imwrite_any(crop_path, crop):
+                                raise RuntimeError(_t_global("无法写入 ROI 临时图片", "Failed to write ROI temp image"))
 
                             results = self.ocr_engine.recognize(crop_path) or []
                             # Offset rects back to (scaled) full-image coordinates.
@@ -917,7 +1142,7 @@ class OCRRoiThread(QThread):
             if w <= 0 or h <= 0:
                 raise RuntimeError(_t_global("选区无效", "Invalid ROI"))
 
-            img = cv2.imread(self.image_path)
+            img = _imread_any(self.image_path)
             if img is None:
                 raise RuntimeError(_t_global("无法读取图片", "Failed to read image"))
 
@@ -928,11 +1153,15 @@ class OCRRoiThread(QThread):
             h = max(1, min(h, H - y))
 
             crop = img[y : y + h, x : x + w]
-            base = os.path.splitext(os.path.basename(self.image_path))[0]
-            # 清理文件名中的特殊字符，防止路径注入
-            safe_base = re.sub(r'[^\w\-.]', '_', base)
-            out_path = os.path.join(self.out_dir, f"roi_ocr_{safe_base}_{x}_{y}_{w}x{h}.png")
-            cv2.imwrite(out_path, crop)
+            out_path = build_asset_path(
+                self.out_dir,
+                "roi_ocr",
+                self.image_path,
+                suffix=f"{x}_{y}_{w}x{h}",
+                ext=".png",
+            )
+            if not _imwrite_any(out_path, crop):
+                raise RuntimeError(_t_global("无法写入 ROI 临时图片", "Failed to write ROI temp image"))
 
             results = self.ocr_engine.recognize(out_path) or []
             # Offset rects back to original coordinates
@@ -953,11 +1182,21 @@ class OCRRoiThread(QThread):
 
 
 class InpaintThread(QThread):
-    """Call IOPaint API to inpaint text regions (mask built from OCR boxes)."""
+    """Text removal with explicit fill / IOPaint modes and per-box overrides."""
     progress = Signal(int, int)      # (current, total)
     finished_one = Signal(str, str)  # (src_path, out_path)
     error = Signal(str)
     all_done = Signal(bool)          # (canceled)
+
+    STRATEGY_LOCAL_FILL = "local_fill"
+    STRATEGY_LOCAL_CV2 = "local_cv2"
+    STRATEGY_REMOTE = "remote"
+    MODE_AUTO = "auto"
+    MODE_FILL = "fill"
+    MODE_REMOTE = "remote"
+    RUN_SMART = "smart"
+    RUN_FILL = "fill"
+    RUN_REMOTE = "remote"
 
     def __init__(
         self,
@@ -970,6 +1209,11 @@ class InpaintThread(QThread):
         input_image_by_src=None,
         roi_by_image=None,
         timeout_sec=120,
+        run_mode="smart",
+        fill_pad_x=10,
+        fill_pad_y=6,
+        remote_pad_x=8,
+        remote_pad_y=4,
     ):
         super().__init__()
         self.images = list(images or [])
@@ -985,133 +1229,998 @@ class InpaintThread(QThread):
         self.input_image_by_src = input_image_by_src or {}
         self.roi_by_image = roi_by_image or {}
         self.timeout_sec = int(timeout_sec or 120)
+        self.run_mode = self._normalize_run_mode(run_mode)
+        self.fill_pad_x = max(0, int(fill_pad_x or 0))
+        self.fill_pad_y = max(0, int(fill_pad_y or 0))
+        self.remote_pad_x = max(0, int(remote_pad_x or 0))
+        self.remote_pad_y = max(0, int(remote_pad_y or 0))
         self.results = []  # list[(src, out)]
 
-    def run(self):
-        import base64
-        import time
-        from io import BytesIO
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    @classmethod
+    def _normalize_box_clean_mode(cls, value):
+        mode = str(value or "").strip().lower()
+        if mode in {"fill", "solid", "solid_fill", "color_fill"}:
+            return cls.MODE_FILL
+        if mode in {"remote", "iopaint", "api"}:
+            return cls.MODE_REMOTE
+        return cls.MODE_AUTO
 
-        import requests
-        from PIL import Image, ImageDraw, ImageFilter
+    @classmethod
+    def _normalize_run_mode(cls, value):
+        mode = str(value or "").strip().lower()
+        if mode in {cls.RUN_FILL, cls.MODE_FILL, "solid", "solid_fill", "color_fill"}:
+            return cls.RUN_FILL
+        if mode in {cls.RUN_REMOTE, cls.MODE_REMOTE, "iopaint", "api"}:
+            return cls.RUN_REMOTE
+        return cls.RUN_SMART
 
-        def to_b64(img):
-            buf = BytesIO()
-            img.save(buf, "PNG")
-            return base64.b64encode(buf.getvalue()).decode("ascii")
+    @staticmethod
+    def _extract_rect(box):
+        if not isinstance(box, dict):
+            return None
+        rect = box.get("rect")
+        if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
+            return None
+        try:
+            x, y, w, h = [int(v) for v in rect]
+        except Exception:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return [x, y, w, h]
 
-        def _extract_rect(box):
-            if not isinstance(box, dict):
-                return None
-            rect = box.get("rect")
-            if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
-                return None
+    @classmethod
+    def _extract_polygon(cls, box):
+        if not isinstance(box, dict):
+            return None
+        bbox = box.get("bbox")
+        if isinstance(bbox, np.ndarray):
             try:
-                x, y, w, h = [int(v) for v in rect]
+                bbox = bbox.tolist()
             except Exception:
-                return None
-            if w <= 0 or h <= 0:
-                return None
-            return [x, y, w, h]
+                bbox = None
 
-        def _intersects_roi(rect, roi):
-            if roi is None:
-                return True
-            try:
-                x, y, w, h = rect
-                rx, ry, rw, rh = roi
-            except Exception:
-                return True
-            return not (x + w <= rx or x >= rx + rw or y + h <= ry or y >= ry + rh)
+        points = []
+        if isinstance(bbox, (list, tuple)):
+            for pt in bbox:
+                if not (isinstance(pt, (list, tuple)) and len(pt) >= 2):
+                    points = []
+                    break
+                try:
+                    px = int(round(float(pt[0])))
+                    py = int(round(float(pt[1])))
+                except Exception:
+                    points = []
+                    break
+                points.append([px, py])
 
-        def create_mask(img_size, boxes, padding):
-            mask = Image.new("L", img_size, 0)
-            draw = ImageDraw.Draw(mask)
-            W, H = img_size
-            for b in boxes or []:
-                rect = _extract_rect(b)
-                if rect is None:
+        if len(points) >= 3:
+            return points
+
+        rect = cls._extract_rect(box)
+        if rect is None:
+            return None
+        x, y, w, h = rect
+        return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+
+    @staticmethod
+    def _intersects_roi(rect, roi):
+        if roi is None:
+            return True
+        try:
+            x, y, w, h = rect
+            rx, ry, rw, rh = roi
+        except Exception:
+            return True
+        return not (x + w <= rx or x >= rx + rw or y + h <= ry or y >= ry + rh)
+
+    @classmethod
+    def _create_mask(cls, img_size, boxes, padding, prefer_rect=False, rect_expand_x=0, rect_expand_y=0):
+        W, H = img_size
+        mask = np.zeros((max(1, int(H)), max(1, int(W))), dtype=np.uint8)
+        extra_x = max(0, int(rect_expand_x or 0))
+        extra_y = max(0, int(rect_expand_y or 0))
+        for b in boxes or []:
+            poly = None if prefer_rect else cls._extract_polygon(b)
+            if poly and len(poly) >= 3:
+                arr = np.array(poly, dtype=np.int32)
+                arr[:, 0] = np.clip(arr[:, 0], 0, max(0, W - 1))
+                arr[:, 1] = np.clip(arr[:, 1], 0, max(0, H - 1))
+                if int(abs(cv2.contourArea(arr))) > 0:
+                    cv2.fillPoly(mask, [arr], 255)
                     continue
-                x, y, w, h = rect
-                x1 = max(0, x - padding)
-                y1 = max(0, y - padding)
-                x2 = min(W, x + w + padding)
-                y2 = min(H, y + h + padding)
-                draw.rectangle([x1, y1, x2, y2], fill=255)
-            return mask
 
-        def _limit_mask_to_roi(mask_pil, roi, img_size):
-            if not (isinstance(roi, (list, tuple)) and len(roi) == 4):
-                return mask_pil
-            try:
-                rx, ry, rw, rh = [int(v) for v in roi]
-            except Exception:
-                return mask_pil
-            if rw <= 0 or rh <= 0:
-                return mask_pil
+            rect = cls._extract_rect(b)
+            if rect is None:
+                continue
+            x, y, w, h = rect
+            x1 = max(0, x - extra_x)
+            y1 = max(0, y - extra_y)
+            x2 = min(W, x + w + extra_x)
+            y2 = min(H, y + h + extra_y)
+            cv2.rectangle(mask, (x1, y1), (max(x1, x2 - 1), max(y1, y2 - 1)), 255, thickness=-1)
 
-            W, H = img_size
-            rx = max(0, min(rx, W - 1))
-            ry = max(0, min(ry, H - 1))
-            rw = max(1, min(rw, W - rx))
-            rh = max(1, min(rh, H - ry))
+        pad = max(0, int(padding or 0))
+        if pad > 0 and mask.any():
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1))
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        from PIL import Image
+        return Image.fromarray(mask, mode="L")
 
-            roi_box = (rx, ry, rx + rw, ry + rh)
-            m2 = Image.new("L", img_size, 0)
-            m2.paste(mask_pil.crop(roi_box), (rx, ry))
-            return m2
+    @staticmethod
+    def _limit_mask_to_roi(mask_pil, roi, img_size):
+        if not (isinstance(roi, (list, tuple)) and len(roi) == 4):
+            return mask_pil
+        try:
+            rx, ry, rw, rh = [int(v) for v in roi]
+        except Exception:
+            return mask_pil
+        if rw <= 0 or rh <= 0:
+            return mask_pil
 
-        def _split_boxes_evenly(boxes, n_groups):
-            boxes = list(boxes or [])
-            n_groups = max(1, int(n_groups or 1))
-            total = len(boxes)
-            base = total // n_groups
-            rem = total % n_groups
-            out = []
-            idx = 0
-            for i in range(n_groups):
-                sz = base + (1 if i < rem else 0)
-                out.append(boxes[idx : idx + sz])
-                idx += sz
-            return out
+        W, H = img_size
+        rx = max(0, min(rx, W - 1))
+        ry = max(0, min(ry, H - 1))
+        rw = max(1, min(rw, W - rx))
+        rh = max(1, min(rh, H - ry))
 
-        def call_api_crop(url, image_pil, mask_pil, crop_padding):
-            bbox = mask_pil.getbbox()
-            if not bbox:
+        roi_box = (rx, ry, rx + rw, ry + rh)
+        from PIL import Image
+        m2 = Image.new("L", img_size, 0)
+        m2.paste(mask_pil.crop(roi_box), (rx, ry))
+        return m2
+
+    @staticmethod
+    def _rects_touch(rect_a, rect_b, gap):
+        try:
+            ax, ay, aw, ah = rect_a
+            bx, by, bw, bh = rect_b
+        except Exception:
+            return False
+        g = max(0, int(gap or 0))
+        return not (
+            (ax + aw + g) < bx
+            or (bx + bw + g) < ax
+            or (ay + ah + g) < by
+            or (by + bh + g) < ay
+        )
+
+    @classmethod
+    def _cluster_boxes(cls, boxes, merge_gap):
+        valid = []
+        for b in boxes or []:
+            rect = cls._extract_rect(b)
+            if rect is None:
+                continue
+            valid.append((rect, b))
+        n = len(valid)
+        if n <= 1:
+            return [[b] for _, b in valid]
+
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i in range(n):
+            rect_i, _ = valid[i]
+            for j in range(i + 1, n):
+                rect_j, _ = valid[j]
+                if cls._rects_touch(rect_i, rect_j, merge_gap):
+                    union(i, j)
+
+        groups = {}
+        for idx, (rect, box) in enumerate(valid):
+            root = find(idx)
+            groups.setdefault(root, []).append((rect[1], rect[0], box))
+
+        clusters = []
+        for items in groups.values():
+            items.sort(key=lambda t: (t[0], t[1]))
+            clusters.append([box for _, _, box in items])
+        clusters.sort(
+            key=lambda grp: (
+                cls._extract_rect(grp[0])[1] if cls._extract_rect(grp[0]) else 0,
+                cls._extract_rect(grp[0])[0] if cls._extract_rect(grp[0]) else 0,
+            )
+        )
+        return clusters
+
+    @staticmethod
+    def _crop_from_mask(image_pil, mask_pil, crop_padding):
+        bbox = mask_pil.getbbox()
+        if not bbox:
+            return None
+
+        left, top, right, bottom = bbox
+        W, H = image_pil.size
+        pad = int(crop_padding or 0)
+        x1 = max(0, int(left) - pad)
+        y1 = max(0, int(top) - pad)
+        x2 = min(W, int(right) + pad)
+        y2 = min(H, int(bottom) + pad)
+        crop_box = (x1, y1, x2, y2)
+        crop_img = image_pil.crop(crop_box)
+        crop_mask = mask_pil.crop(crop_box)
+        return crop_box, crop_img, crop_mask
+
+    @staticmethod
+    def _analysis_ring(mask_u8):
+        base = (np.asarray(mask_u8, dtype=np.uint8) > 0).astype(np.uint8)
+        if not base.any():
+            return base.astype(bool)
+        h, w = base.shape[:2]
+        pad = max(4, min(24, int(round(max(h, w) * 0.08))))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1))
+        outer = cv2.dilate(base * 255, kernel, iterations=1)
+        ring = (outer > 0) & (~base.astype(bool))
+        if int(ring.sum()) < 96:
+            ring = ~base.astype(bool)
+        return ring
+
+    @staticmethod
+    def _fill_sample_ring(mask_u8):
+        base = (np.asarray(mask_u8, dtype=np.uint8) > 0).astype(np.uint8)
+        if not base.any():
+            return base.astype(bool)
+
+        h, w = base.shape[:2]
+        inner_pad = max(2, min(8, int(round(min(h, w) * 0.06))))
+        inner_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (inner_pad * 2 + 1, inner_pad * 2 + 1))
+        eroded = cv2.erode(base * 255, inner_kernel, iterations=1)
+        inner_ring = (base > 0) & (~(eroded > 0))
+        if int(inner_ring.sum()) >= 48:
+            return inner_ring
+
+        outer_pad = max(2, min(6, int(round(min(h, w) * 0.04))))
+        outer_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (outer_pad * 2 + 1, outer_pad * 2 + 1))
+        dilated = cv2.dilate(base * 255, outer_kernel, iterations=1)
+        outer_ring = (dilated > 0) & (~(base > 0))
+        ring = inner_ring | outer_ring
+        if int(ring.sum()) >= 48:
+            return ring
+        return outer_ring if int(outer_ring.sum()) >= 16 else (~(base > 0))
+
+    @classmethod
+    def _fit_plane_residual(cls, img_rgb, sample_mask):
+        ys, xs = np.nonzero(sample_mask)
+        if len(xs) < 32:
+            return None
+        if len(xs) > 5000:
+            step = max(1, len(xs) // 5000)
+            xs = xs[::step]
+            ys = ys[::step]
+        xs_f = xs.astype(np.float64)
+        ys_f = ys.astype(np.float64)
+        A = np.stack([xs_f, ys_f, np.ones_like(xs_f, dtype=np.float64)], axis=1)
+        residuals = []
+        for c in range(3):
+            vals = img_rgb[ys, xs, c].astype(np.float64)
+            coeff, *_ = np.linalg.lstsq(A, vals, rcond=None)
+            if not np.all(np.isfinite(coeff)):
                 return None
+            pred = coeff[0] * xs_f + coeff[1] * ys_f + coeff[2]
+            if not np.all(np.isfinite(pred)):
+                return None
+            residuals.append(float(np.mean(np.abs(pred - vals))))
+        if not residuals:
+            return None
+        return float(sum(residuals) / len(residuals))
 
-            left, top, right, bottom = bbox
-            W, H = image_pil.size
-            pad = int(crop_padding or 0)
-            x1 = max(0, int(left) - pad)
-            y1 = max(0, int(top) - pad)
-            x2 = min(W, int(right) + pad)
-            y2 = min(H, int(bottom) + pad)
-            crop_box = (x1, y1, x2, y2)
-
-            crop_img = image_pil.crop(crop_box)
-            crop_mask = mask_pil.crop(crop_box)
-            payload = {
-                "image": to_b64(crop_img),
-                "mask": to_b64(crop_mask),
-                # Reasonable defaults (same spirit as the reference project)
-                "ldm_steps": 30,
-                "hd_strategy": "Original",
-                "sd_sampler": "UniPC",
+    @classmethod
+    def _analyze_crop(cls, crop_img, crop_mask):
+        img_rgb = np.asarray(crop_img, dtype=np.uint8)
+        mask_u8 = np.asarray(crop_mask, dtype=np.uint8)
+        sample_mask = cls._analysis_ring(mask_u8)
+        if int(sample_mask.sum()) < 64:
+            return {
+                "strategy": cls.STRATEGY_REMOTE,
+                "edge_density": 1.0,
+                "texture": 999.0,
+                "color_std": 999.0,
+                "plane_residual": 999.0,
             }
 
-            resp = requests.post(str(url), json=payload, timeout=self.timeout_sec)
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    _t_global(
-                        f"IOPaint API返回错误: {resp.status_code} {resp.text[:200]}",
-                        f"IOPaint API error: {resp.status_code} {resp.text[:200]}",
-                    )
-                )
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150) > 0
+        edge_density = float(edges[sample_mask].mean()) if sample_mask.any() else 1.0
 
-            res_crop = Image.open(BytesIO(resp.content)).convert("RGB")
-            return (crop_box, res_crop, crop_mask)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        texture = float(np.mean(np.abs(gray.astype(np.float32) - blur.astype(np.float32))[sample_mask]))
+
+        sample_pixels = img_rgb[sample_mask]
+        color_std = float(np.mean(np.std(sample_pixels.astype(np.float32), axis=0))) if sample_pixels.size else 999.0
+        color_range = 999.0
+        if sample_pixels.size:
+            try:
+                p95 = np.percentile(sample_pixels.astype(np.float32), 95, axis=0)
+                p05 = np.percentile(sample_pixels.astype(np.float32), 5, axis=0)
+                color_range = float(np.mean(np.abs(p95 - p05)))
+            except Exception:
+                color_range = 999.0
+
+        plane_residual = cls._fit_plane_residual(img_rgb, sample_mask)
+        plane_residual = float(plane_residual) if plane_residual is not None else 999.0
+
+        # "单色覆盖" should only be used on genuinely flat backgrounds.
+        # Keep the gate strict so light gradients / shadows / tinted panels fall back to IOPaint.
+        if plane_residual <= 2.0 and edge_density <= 0.010 and texture <= 1.8 and color_std <= 6.0 and color_range <= 8.0:
+            strategy = cls.STRATEGY_LOCAL_FILL
+        else:
+            strategy = cls.STRATEGY_REMOTE
+
+        return {
+            "strategy": strategy,
+            "edge_density": edge_density,
+            "texture": texture,
+            "color_std": color_std,
+            "color_range": color_range,
+            "plane_residual": plane_residual,
+        }
+
+    @staticmethod
+    def _extract_runs_1d(mask_line):
+        runs = []
+        start = None
+        for idx, val in enumerate(mask_line):
+            if bool(val):
+                if start is None:
+                    start = idx
+            elif start is not None:
+                runs.append((start, idx - 1))
+                start = None
+        if start is not None:
+            runs.append((start, len(mask_line) - 1))
+        return runs
+
+    @staticmethod
+    def _sample_median_color(img_rgb, sample_mask):
+        try:
+            pixels = img_rgb[np.asarray(sample_mask, dtype=bool)]
+        except Exception:
+            return None
+        if pixels.size == 0:
+            return None
+        vals = np.median(pixels.astype(np.float32), axis=0)
+        return tuple(int(np.clip(v, 0, 255)) for v in vals[:3])
+
+    @classmethod
+    def _estimate_fill_color(cls, img_rgb, sample_mask):
+        try:
+            pixels = img_rgb[np.asarray(sample_mask, dtype=bool)]
+        except Exception:
+            pixels = None
+        if pixels is None or pixels.size == 0:
+            return None
+        pixels = pixels.reshape(-1, 3).astype(np.uint8)
+        if len(pixels) > 12000:
+            step = max(1, len(pixels) // 12000)
+            pixels = pixels[::step]
+        # Quantize first, then take the median inside the dominant bucket.
+        quant = (pixels // 16).astype(np.uint8)
+        try:
+            uniq, counts = np.unique(quant, axis=0, return_counts=True)
+        except Exception:
+            uniq = counts = None
+        if uniq is None or counts is None or len(uniq) == 0:
+            vals = np.median(pixels.astype(np.float32), axis=0)
+            return tuple(int(np.clip(v, 0, 255)) for v in vals[:3])
+        bucket = uniq[int(np.argmax(counts))]
+        chosen = pixels[np.all(quant == bucket, axis=1)]
+        if chosen.size == 0:
+            chosen = pixels
+        vals = np.median(chosen.astype(np.float32), axis=0)
+        return tuple(int(np.clip(v, 0, 255)) for v in vals[:3])
+
+    @classmethod
+    def _register_overlay(cls, overlays, orientation, pos, start, end, color, thickness):
+        if color is None or end <= start:
+            return
+        pos = int(pos)
+        start = int(start)
+        end = int(end)
+        thickness = max(1, int(thickness or 1))
+        for item in overlays:
+            if item.get("orientation") != orientation:
+                continue
+            if abs(int(item.get("pos", 0)) - pos) > max(int(item.get("thickness", 1)), thickness):
+                continue
+            if end < int(item.get("start", 0)) - 6 or start > int(item.get("end", 0)) + 6:
+                continue
+            item["pos"] = int(round((int(item.get("pos", pos)) + pos) / 2.0))
+            item["start"] = min(int(item.get("start", start)), start)
+            item["end"] = max(int(item.get("end", end)), end)
+            item["thickness"] = max(int(item.get("thickness", 1)), thickness)
+            prev_color = item.get("color") or color
+            item["color"] = tuple(int(round((int(prev_color[i]) + int(color[i])) / 2.0)) for i in range(3))
+            return
+        overlays.append(
+            {
+                "orientation": orientation,
+                "pos": pos,
+                "start": start,
+                "end": end,
+                "color": tuple(int(v) for v in color),
+                "thickness": thickness,
+            }
+        )
+
+    @classmethod
+    def _collect_line_overlays(cls, crop_img, crop_mask, analysis):
+        img_rgb = np.asarray(crop_img, dtype=np.uint8)
+        mask_u8 = np.asarray(crop_mask, dtype=np.uint8)
+        mask_bool = mask_u8 > 0
+        h, w = mask_bool.shape[:2]
+        if h < 8 or w < 8 or int(mask_bool.sum()) < 24:
+            return []
+
+        strategy = str((analysis or {}).get("strategy") or cls.STRATEGY_REMOTE)
+        edge_density = float((analysis or {}).get("edge_density", 1.0))
+        if strategy == cls.STRATEGY_REMOTE and edge_density > 0.16:
+            return []
+
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        sample_mask = cls._analysis_ring(mask_u8)
+        sample_vals = gray[sample_mask] if sample_mask.any() else gray.reshape(-1)
+        if sample_vals.size < 32:
+            return []
+
+        median = float(np.median(sample_vals))
+        spread = max(12.0, float(np.std(sample_vals)) * 0.9 + 6.0)
+        dark = (gray <= max(0.0, median - spread)).astype(np.uint8) * 255
+        light = (gray >= min(255.0, median + spread)).astype(np.uint8) * 255
+        dark[mask_bool] = 0
+        light[mask_bool] = 0
+        bg_color = np.median(img_rgb[sample_mask].astype(np.float32), axis=0) if sample_mask.any() else np.array([255.0, 255.0, 255.0], dtype=np.float32)
+
+        min_h_len = max(14, w // 8)
+        min_v_len = max(14, h // 8)
+        hk = cv2.getStructuringElement(cv2.MORPH_RECT, (min_h_len, 1))
+        vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_v_len))
+        horizontal_dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, hk)
+        horizontal_light = cv2.morphologyEx(light, cv2.MORPH_OPEN, hk)
+        vertical_dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, vk)
+        vertical_light = cv2.morphologyEx(light, cv2.MORPH_OPEN, vk)
+        horizontal = cv2.bitwise_or(horizontal_dark, horizontal_light)
+        vertical = cv2.bitwise_or(vertical_dark, vertical_light)
+
+        overlays = []
+        rows = np.where(mask_bool.any(axis=1))[0]
+        cols = np.where(mask_bool.any(axis=0))[0]
+
+        for y in rows:
+            if not (horizontal[y] > 0).any():
+                continue
+            for start, end in cls._extract_runs_1d(mask_bool[y]):
+                best = None
+                for support_src in (horizontal_dark, horizontal_light):
+                    support_row = support_src[y] > 0
+                    left_idx = np.where(support_row[:start])[0]
+                    right_idx = np.where(support_row[end + 1 :])[0]
+                    if left_idx.size == 0 or right_idx.size == 0:
+                        continue
+                    x1 = int(left_idx[-1])
+                    x2 = int(end + 1 + right_idx[0])
+                    if (x2 - x1) < max(10, min_h_len // 2):
+                        continue
+                    y1 = max(0, y - 1)
+                    y2 = min(h, y + 2)
+                    sx1 = max(0, x1 - 12)
+                    sx2 = min(w, x2 + 13)
+                    support_strip = (support_src[y1:y2, sx1:sx2] > 0) & (~mask_bool[y1:y2, sx1:sx2])
+                    color = cls._sample_median_color(img_rgb[y1:y2, sx1:sx2], support_strip)
+                    if color is None:
+                        continue
+                    contrast = float(np.mean(np.abs(np.asarray(color, dtype=np.float32) - bg_color)))
+                    score = float(np.count_nonzero(support_strip)) + contrast * 10.0
+                    if best is None or score > best["score"]:
+                        best = {
+                            "x1": x1,
+                            "x2": x2,
+                            "color": color,
+                            "score": score,
+                            "thickness": int(np.clip(np.sum(np.any(support_src[max(0, y - 2) : min(h, y + 3), x1 : x2 + 1] > 0, axis=1)), 1, 3)),
+                            "contrast": contrast,
+                        }
+                if best and best["contrast"] >= 8.0:
+                    cls._register_overlay(overlays, "h", y, best["x1"], best["x2"], best["color"], best["thickness"])
+
+        for x in cols:
+            if not (vertical[:, x] > 0).any():
+                continue
+            for start, end in cls._extract_runs_1d(mask_bool[:, x]):
+                best = None
+                for support_src in (vertical_dark, vertical_light):
+                    support_col = support_src[:, x] > 0
+                    top_idx = np.where(support_col[:start])[0]
+                    bottom_idx = np.where(support_col[end + 1 :])[0]
+                    if top_idx.size == 0 or bottom_idx.size == 0:
+                        continue
+                    y1 = int(top_idx[-1])
+                    y2 = int(end + 1 + bottom_idx[0])
+                    if (y2 - y1) < max(10, min_v_len // 2):
+                        continue
+                    x1 = max(0, x - 1)
+                    x2 = min(w, x + 2)
+                    sy1 = max(0, y1 - 12)
+                    sy2 = min(h, y2 + 13)
+                    support_strip = (support_src[sy1:sy2, x1:x2] > 0) & (~mask_bool[sy1:sy2, x1:x2])
+                    color = cls._sample_median_color(img_rgb[sy1:sy2, x1:x2], support_strip)
+                    if color is None:
+                        continue
+                    contrast = float(np.mean(np.abs(np.asarray(color, dtype=np.float32) - bg_color)))
+                    score = float(np.count_nonzero(support_strip)) + contrast * 10.0
+                    if best is None or score > best["score"]:
+                        best = {
+                            "y1": y1,
+                            "y2": y2,
+                            "color": color,
+                            "score": score,
+                            "thickness": int(np.clip(np.sum(np.any(support_src[y1 : y2 + 1, max(0, x - 2) : min(w, x + 3)] > 0, axis=0)), 1, 3)),
+                            "contrast": contrast,
+                        }
+                if best and best["contrast"] >= 8.0:
+                    cls._register_overlay(overlays, "v", x, best["y1"], best["y2"], best["color"], best["thickness"])
+
+        return overlays
+
+    @staticmethod
+    def _draw_line_overlays(crop_img, overlays):
+        if not overlays:
+            return crop_img
+        from PIL import Image
+
+        arr = np.asarray(crop_img, dtype=np.uint8).copy()
+        h, w = arr.shape[:2]
+        for item in overlays:
+            try:
+                orientation = str(item.get("orientation") or "")
+                pos = int(item.get("pos", 0))
+                start = int(item.get("start", 0))
+                end = int(item.get("end", 0))
+                color = tuple(int(v) for v in (item.get("color") or (0, 0, 0)))
+                thickness = max(1, int(item.get("thickness", 1)))
+            except Exception:
+                continue
+            if orientation == "h":
+                pos = max(0, min(pos, h - 1))
+                start = max(0, min(start, w - 1))
+                end = max(0, min(end, w - 1))
+                if end > start:
+                    cv2.line(arr, (start, pos), (end, pos), color, thickness=thickness, lineType=cv2.LINE_AA)
+            elif orientation == "v":
+                pos = max(0, min(pos, w - 1))
+                start = max(0, min(start, h - 1))
+                end = max(0, min(end, h - 1))
+                if end > start:
+                    cv2.line(arr, (pos, start), (pos, end), color, thickness=thickness, lineType=cv2.LINE_AA)
+        return Image.fromarray(arr, mode="RGB")
+
+    @classmethod
+    def _run_local_fill(cls, crop_img, crop_mask, analysis=None):
+        from PIL import Image
+
+        img_rgb = np.asarray(crop_img, dtype=np.uint8)
+        mask_u8 = np.asarray(crop_mask, dtype=np.uint8)
+        hard_mask = bool((analysis or {}).get("hard_mask", False))
+        sample_mask_src = None
+        if hard_mask:
+            sample_mask_src = (analysis or {}).get("sample_mask")
+            try:
+                if sample_mask_src is not None:
+                    sample_mask_src = np.asarray(sample_mask_src, dtype=np.uint8)
+            except Exception:
+                sample_mask_src = None
+        if sample_mask_src is None:
+            sample_mask_src = mask_u8
+        sample_mask = cls._fill_sample_ring(sample_mask_src) if hard_mask else cls._analysis_ring(mask_u8)
+        fill_color = cls._estimate_fill_color(img_rgb, sample_mask)
+        if fill_color is None:
+            fallback_mask = ~(mask_u8 > 0)
+            fill_color = cls._estimate_fill_color(img_rgb, fallback_mask)
+        if fill_color is None:
+            return None
+
+        pred = np.empty_like(img_rgb, dtype=np.uint8)
+        pred[:, :] = np.asarray(fill_color, dtype=np.uint8)
+        mask_f = (mask_u8 > 0).astype(np.float32)
+        if not hard_mask:
+            mask_f = cv2.GaussianBlur(mask_f, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        mask_f = np.clip(mask_f, 0.0, 1.0)[..., None]
+
+        blended = img_rgb.astype(np.float32) * (1.0 - mask_f) + pred.astype(np.float32) * mask_f
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+        return Image.fromarray(blended, mode="RGB")
+
+    @classmethod
+    def _run_local_cv2(cls, crop_img, crop_mask, analysis):
+        from PIL import Image
+
+        img_bgr = cv2.cvtColor(np.asarray(crop_img, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+        mask_u8 = (np.asarray(crop_mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+
+        edge_density = float((analysis or {}).get("edge_density", 1.0))
+        plane_residual = float((analysis or {}).get("plane_residual", 999.0))
+        radius = 3 if edge_density <= 0.05 else 4
+        method = cv2.INPAINT_NS if plane_residual <= 10.0 and edge_density <= 0.04 else cv2.INPAINT_TELEA
+        out_bgr = cv2.inpaint(img_bgr, mask_u8, radius, method)
+        out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(out_rgb, mode="RGB")
+
+    @classmethod
+    def _run_local_strategy(cls, crop_img, crop_mask, analysis):
+        strategy = str((analysis or {}).get("strategy") or cls.STRATEGY_REMOTE)
+        if strategy == cls.STRATEGY_LOCAL_FILL:
+            return cls._run_local_fill(crop_img, crop_mask, analysis)
+        if strategy == cls.STRATEGY_LOCAL_CV2:
+            return cls._run_local_cv2(crop_img, crop_mask, analysis)
+        return None
+
+    def _call_api_crop(self, url, image_pil, mask_pil, crop_padding):
+        import base64
+        from io import BytesIO
+
+        import requests
+        from PIL import Image
+
+        payload_crop = self._crop_from_mask(image_pil, mask_pil, crop_padding=crop_padding)
+        if not payload_crop:
+            return None
+
+        crop_box, crop_img, crop_mask = payload_crop
+        buf_img = BytesIO()
+        crop_img.save(buf_img, "PNG")
+        buf_mask = BytesIO()
+        crop_mask.save(buf_mask, "PNG")
+        payload = {
+            "image": base64.b64encode(buf_img.getvalue()).decode("ascii"),
+            "mask": base64.b64encode(buf_mask.getvalue()).decode("ascii"),
+            # Reasonable defaults (same spirit as the reference project)
+            "ldm_steps": 30,
+            "hd_strategy": "Original",
+            "sd_sampler": "UniPC",
+        }
+
+        resp = requests.post(str(url), json=payload, timeout=self.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                _t_global(
+                    f"IOPaint API返回错误: {resp.status_code} {resp.text[:200]}",
+                    f"IOPaint API error: {resp.status_code} {resp.text[:200]}",
+                )
+            )
+
+        res_crop = Image.open(BytesIO(resp.content)).convert("RGB")
+        if tuple(getattr(res_crop, "size", ())) != tuple(getattr(crop_img, "size", ())):
+            raise RuntimeError(
+                _t_global(
+                    f"IOPaint 返回尺寸异常: {getattr(res_crop, 'size', None)} != {getattr(crop_img, 'size', None)}",
+                    f"IOPaint returned an unexpected image size: {getattr(res_crop, 'size', None)} != {getattr(crop_img, 'size', None)}",
+                )
+            )
+        return (crop_box, res_crop, crop_mask)
+
+    @staticmethod
+    def _apply_crop_result(final_img, crop_res):
+        if not crop_res:
+            return
+        from PIL import Image, ImageFilter
+
+        payload = list(crop_res) + [None, None]
+        crop_box, res_crop, crop_mask, overlays, options = payload[:5]
+        if overlays:
+            try:
+                res_crop = InpaintThread._draw_line_overlays(res_crop, overlays)
+            except Exception:
+                pass
+        options = options or {}
+        try:
+            blur_radius = float(options.get("blur_radius", 3.0))
+            if blur_radius <= 0:
+                blur_mask = crop_mask
+            else:
+                blur_mask = crop_mask.filter(ImageFilter.GaussianBlur(blur_radius))
+        except Exception:
+            blur_mask = crop_mask
+        orig_crop_area = final_img.crop(crop_box)
+        blended = Image.composite(res_crop, orig_crop_area, blur_mask)
+        final_img.paste(blended, (int(crop_box[0]), int(crop_box[1])))
+
+    def _normalize_roi(self, roi, img_size):
+        if not (isinstance(roi, (list, tuple)) and len(roi) == 4):
+            return None
+        try:
+            rx, ry, rw, rh = [int(v) for v in roi]
+        except Exception:
+            return None
+        if rw <= 0 or rh <= 0:
+            return None
+
+        W, H = img_size
+        rx = max(0, min(rx, W - 1))
+        ry = max(0, min(ry, H - 1))
+        rw = max(1, min(rw, W - rx))
+        rh = max(1, min(rh, H - ry))
+        return [rx, ry, rw, rh]
+
+    def _build_tasks(self, src, img, boxes_raw, roi):
+        buckets = {
+            self.MODE_AUTO: [],
+            self.MODE_FILL: [],
+            self.MODE_REMOTE: [],
+        }
+        for b in boxes_raw:
+            if not isinstance(b, dict):
+                continue
+            if not bool(b.get("clean_enabled", True)):
+                continue
+            rect = self._extract_rect(b)
+            if rect is None:
+                continue
+            if not self._intersects_roi(rect, roi):
+                continue
+            x, y, _, _ = rect
+            mode = self._normalize_box_clean_mode(b.get("clean_mode"))
+            if self.run_mode == self.RUN_FILL:
+                effective_mode = self.MODE_FILL
+            elif self.run_mode == self.RUN_REMOTE:
+                effective_mode = self.MODE_REMOTE
+            else:
+                effective_mode = mode
+            buckets.setdefault(effective_mode, []).append((y, x, b))
+        if not any(buckets.values()):
+            return []
+
+        tasks = []
+        next_idx = 0
+        for requested_mode, sortable in buckets.items():
+            if not sortable:
+                continue
+            sortable.sort(key=lambda t: (t[0], t[1]))
+            boxes = [t[2] for t in sortable]
+            if requested_mode in (self.MODE_FILL, self.MODE_REMOTE, self.MODE_AUTO):
+                # Decide per OCR box. Smart mode also needs per-box analysis so the background
+                # complexity is judged on the actual text region instead of a merged paragraph/table row.
+                clusters = [[box] for box in boxes]
+            else:
+                clusters = self._cluster_boxes(boxes, merge_gap=max(8, int(self.box_padding) * 2 + 6))
+            for cluster in clusters:
+                prefer_rect = bool(requested_mode in (self.MODE_FILL, self.MODE_REMOTE))
+                mask_padding = 0 if requested_mode == self.MODE_FILL else max(0, self.box_padding)
+                sample_mask_pil = None
+                if requested_mode == self.MODE_FILL:
+                    sample_mask_pil = self._create_mask(
+                        img.size,
+                        cluster,
+                        padding=0,
+                        prefer_rect=True,
+                        rect_expand_x=0,
+                        rect_expand_y=0,
+                    )
+                mask_pil = self._create_mask(
+                    img.size,
+                    cluster,
+                    padding=mask_padding,
+                    prefer_rect=prefer_rect,
+                    rect_expand_x=self.fill_pad_x if requested_mode == self.MODE_FILL else (self.remote_pad_x if requested_mode == self.MODE_REMOTE else 0),
+                    rect_expand_y=self.fill_pad_y if requested_mode == self.MODE_FILL else (self.remote_pad_y if requested_mode == self.MODE_REMOTE else 0),
+                )
+                if roi is not None:
+                    mask_pil = self._limit_mask_to_roi(mask_pil, roi, img.size)
+                    if sample_mask_pil is not None:
+                        sample_mask_pil = self._limit_mask_to_roi(sample_mask_pil, roi, img.size)
+                crop_payload = self._crop_from_mask(img, mask_pil, crop_padding=max(0, self.crop_padding))
+                if not crop_payload:
+                    continue
+                crop_box, crop_img, crop_mask = crop_payload
+                analysis = self._analyze_crop(crop_img, crop_mask)
+                if requested_mode == self.MODE_AUTO and analysis.get("strategy") == self.STRATEGY_REMOTE:
+                    # Smart remote should use the same stronger rectangular mask as explicit IOPaint.
+                    mask_pil = self._create_mask(
+                        img.size,
+                        cluster,
+                        padding=max(0, self.box_padding),
+                        prefer_rect=True,
+                        rect_expand_x=self.remote_pad_x,
+                        rect_expand_y=self.remote_pad_y,
+                    )
+                    if roi is not None:
+                        mask_pil = self._limit_mask_to_roi(mask_pil, roi, img.size)
+                    crop_payload = self._crop_from_mask(img, mask_pil, crop_padding=max(0, self.crop_padding))
+                    if not crop_payload:
+                        continue
+                    crop_box, crop_img, crop_mask = crop_payload
+                    analysis = self._analyze_crop(crop_img, crop_mask)
+                    analysis["strategy"] = self.STRATEGY_REMOTE
+                    analysis["mask_shape"] = "rect"
+                elif requested_mode == self.MODE_AUTO and analysis.get("strategy") == self.STRATEGY_LOCAL_FILL:
+                    # Keep smart-fill behavior aligned with explicit "单色本页": rect mask + per-axis expansion.
+                    sample_mask_pil = self._create_mask(
+                        img.size,
+                        cluster,
+                        padding=0,
+                        prefer_rect=True,
+                        rect_expand_x=0,
+                        rect_expand_y=0,
+                    )
+                    mask_pil = self._create_mask(
+                        img.size,
+                        cluster,
+                        padding=0,
+                        prefer_rect=True,
+                        rect_expand_x=self.fill_pad_x,
+                        rect_expand_y=self.fill_pad_y,
+                    )
+                    if roi is not None:
+                        mask_pil = self._limit_mask_to_roi(mask_pil, roi, img.size)
+                        sample_mask_pil = self._limit_mask_to_roi(sample_mask_pil, roi, img.size)
+                    crop_payload = self._crop_from_mask(img, mask_pil, crop_padding=max(0, self.crop_padding))
+                    if not crop_payload:
+                        continue
+                    crop_box, crop_img, crop_mask = crop_payload
+                    analysis = self._analyze_crop(crop_img, crop_mask)
+                    analysis["strategy"] = self.STRATEGY_LOCAL_FILL
+                    analysis["hard_mask"] = True
+                    analysis["mask_shape"] = "rect"
+                    analysis["fill_single_box"] = True
+                    if sample_mask_pil is not None:
+                        try:
+                            analysis["sample_mask"] = sample_mask_pil.crop(crop_box)
+                        except Exception:
+                            pass
+                if requested_mode == self.MODE_FILL:
+                    analysis["strategy"] = self.STRATEGY_LOCAL_FILL
+                    analysis["hard_mask"] = True
+                    analysis["mask_shape"] = "rect"
+                    analysis["fill_single_box"] = True
+                    if sample_mask_pil is not None:
+                        try:
+                            analysis["sample_mask"] = sample_mask_pil.crop(crop_box)
+                        except Exception:
+                            pass
+                elif requested_mode == self.MODE_REMOTE:
+                    analysis["strategy"] = self.STRATEGY_REMOTE
+                    analysis["mask_shape"] = "rect"
+                overlays = [] if analysis.get("strategy") == self.STRATEGY_REMOTE or requested_mode == self.MODE_FILL else self._collect_line_overlays(crop_img, crop_mask, analysis)
+                analysis["line_overlays"] = int(len(overlays))
+                analysis["requested_mode"] = requested_mode
+                logger.debug(
+                    "Clean strategy %s for %s cluster %s (requested=%s edge=%.4f texture=%.2f color_std=%.2f plane=%.2f lines=%s)",
+                    analysis.get("strategy"),
+                    os.path.basename(str(src or "")),
+                    next_idx,
+                    requested_mode,
+                    float(analysis.get("edge_density", 0.0)),
+                    float(analysis.get("texture", 0.0)),
+                    float(analysis.get("color_std", 0.0)),
+                    float(analysis.get("plane_residual", 0.0)),
+                    int(analysis.get("line_overlays", 0)),
+                )
+                tasks.append(
+                    {
+                        "index": next_idx,
+                        "boxes": cluster,
+                        "mask": mask_pil,
+                        "analysis": analysis,
+                        "overlays": overlays,
+                        "remote_required": bool(requested_mode == self.MODE_REMOTE or analysis.get("strategy") == self.STRATEGY_REMOTE),
+                        "composite_blur": 0.0 if requested_mode == self.MODE_FILL or analysis.get("strategy") == self.STRATEGY_REMOTE else 3.0,
+                    }
+                )
+                next_idx += 1
+        if tasks:
+            counts = {
+                self.STRATEGY_LOCAL_FILL: 0,
+                self.STRATEGY_LOCAL_CV2: 0,
+                self.STRATEGY_REMOTE: 0,
+            }
+            total_lines = 0
+            for task in tasks:
+                strategy = str((task.get("analysis") or {}).get("strategy") or self.STRATEGY_REMOTE)
+                counts[strategy] = counts.get(strategy, 0) + 1
+                total_lines += int((task.get("analysis") or {}).get("line_overlays", 0) or 0)
+            logger.info(
+                "Clean summary for %s: fill=%d cv2=%d remote=%d line_overlays=%d run_mode=%s",
+                os.path.basename(str(src or "")),
+                int(counts.get(self.STRATEGY_LOCAL_FILL, 0)),
+                int(counts.get(self.STRATEGY_LOCAL_CV2, 0)),
+                int(counts.get(self.STRATEGY_REMOTE, 0)),
+                int(total_lines),
+                self.run_mode,
+            )
+        return tasks
+
+    def _run_remote_tasks(self, img, remote_tasks, api_urls):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if not remote_tasks:
+            return []
+        strict_required = any(bool(task.get("remote_required", False)) for task in remote_tasks)
+        if not api_urls:
+            if strict_required:
+                raise RuntimeError(_t_global("已指定 IOPaint 去字，但未配置可用的 IOPaint API 地址。", "IOPaint was explicitly selected, but no IOPaint API URL is configured."))
+            logger.warning("Complex regions detected but no IOPaint API configured; falling back to local cv2 inpaint.")
+            out = []
+            for task in remote_tasks:
+                payload = self._crop_from_mask(img, task["mask"], crop_padding=max(0, self.crop_padding))
+                if not payload:
+                    continue
+                crop_box, crop_img, crop_mask = payload
+                local_img = self._run_local_cv2(crop_img, crop_mask, task.get("analysis") or {})
+                if local_img is not None:
+                    out.append((task["index"], (crop_box, local_img, crop_mask, task.get("overlays") or [], {"blur_radius": float(task.get("composite_blur", 3.0) or 0.0)})))
+            return out
+
+        def worker(task):
+            start = int(task["index"]) % len(api_urls)
+            last_err = None
+            for off in range(len(api_urls)):
+                url = api_urls[(start + off) % len(api_urls)]
+                try:
+                    crop_res = self._call_api_crop(
+                        url,
+                        img,
+                        task["mask"],
+                        crop_padding=max(0, self.crop_padding),
+                    )
+                    if crop_res:
+                        crop_box, res_crop, crop_mask = crop_res
+                        return task["index"], (crop_box, res_crop, crop_mask, task.get("overlays") or [], {"blur_radius": float(task.get("composite_blur", 3.0) or 0.0)})
+                    return task["index"], None
+                except Exception as e:
+                    last_err = e
+                    continue
+            if bool(task.get("remote_required", False)):
+                raise last_err or RuntimeError(_t_global("IOPaint 请求失败", "IOPaint request failed"))
+            logger.warning("IOPaint failed for cluster %s: %s. Falling back to local cv2 inpaint.", task.get("index"), last_err)
+            payload = self._crop_from_mask(img, task["mask"], crop_padding=max(0, self.crop_padding))
+            if not payload:
+                raise last_err or RuntimeError(_t_global("IOPaint 请求失败", "IOPaint request failed"))
+            crop_box, crop_img, crop_mask = payload
+            local_img = self._run_local_cv2(crop_img, crop_mask, task.get("analysis") or {})
+            if local_img is not None:
+                return task["index"], (crop_box, local_img, crop_mask, task.get("overlays") or [], {"blur_radius": float(task.get("composite_blur", 3.0) or 0.0)})
+            raise last_err or RuntimeError(_t_global("IOPaint 请求失败", "IOPaint request failed"))
+
+        if len(remote_tasks) == 1:
+            return [worker(remote_tasks[0])]
+
+        out = []
+        with ThreadPoolExecutor(max_workers=min(len(api_urls), len(remote_tasks))) as ex:
+            futs = [ex.submit(worker, task) for task in remote_tasks]
+            for fut in as_completed(futs):
+                if self.isInterruptionRequested():
+                    return None
+                idx, crop_res = fut.result()
+                if crop_res:
+                    out.append((idx, crop_res))
+        return out
+
+    def _save_result_image(self, src, final_img):
+        import time
+
+        out_path = build_asset_path(
+            self.out_dir,
+            "inpaint",
+            src,
+            suffix=str(int(time.time() * 1000)),
+            ext=".png",
+        )
+        final_img.save(out_path, "PNG")
+        return out_path
+
+    def run(self):
+        from PIL import Image
 
         total = len(self.images)
         done = 0
@@ -1127,12 +2236,6 @@ class InpaintThread(QThread):
                     self.progress.emit(done, total)
                     continue
 
-                api_urls = list(getattr(self, "api_urls", []) or [])
-                if not api_urls:
-                    raise RuntimeError(_t_global("未设置 IOPaint API 地址", "IOPaint API URL is not set"))
-
-                # By default inpaint the original image; when iterative mode is desired, callers can
-                # pass `input_image_by_src[src] = <inpainted_variant_path>`.
                 in_path = str(src)
                 try:
                     cand = (self.input_image_by_src or {}).get(src)
@@ -1142,116 +2245,39 @@ class InpaintThread(QThread):
                     pass
 
                 img = Image.open(in_path).convert("RGB")
-
-                # Optional ROI: only inpaint boxes that intersect ROI; and clamp mask strictly within ROI.
-                roi = None
-                try:
-                    roi = (self.roi_by_image or {}).get(src)
-                except Exception:
-                    roi = None
-                if isinstance(roi, (list, tuple)) and len(roi) == 4:
-                    try:
-                        rx, ry, rw, rh = [int(v) for v in roi]
-                        W, H = img.size
-                        rx = max(0, min(rx, W - 1))
-                        ry = max(0, min(ry, H - 1))
-                        rw = max(1, min(rw, W - rx))
-                        rh = max(1, min(rh, H - ry))
-                        roi = [rx, ry, rw, rh]
-                    except Exception:
-                        roi = None
-
-                # Validate + sort boxes for predictable split (top->bottom, left->right).
-                sortable = []
-                for b in boxes_raw:
-                    rect = _extract_rect(b)
-                    if rect is None:
-                        continue
-                    if not _intersects_roi(rect, roi):
-                        continue
-                    x, y, _, _ = rect
-                    sortable.append((y, x, b))
-                if not sortable:
-                    self.progress.emit(done, total)
-                    continue
-
-                sortable.sort(key=lambda t: (t[0], t[1]))
-                boxes = [t[2] for t in sortable]
-
-                # Split boxes across multiple endpoints and inpaint concurrently.
-                n_groups = len(api_urls)
-                groups = _split_boxes_evenly(boxes, n_groups) if n_groups > 1 else [boxes]
-
-                tasks = []
-                for gi, gboxes in enumerate(groups):
-                    if not gboxes:
-                        continue
-                    m = create_mask(img.size, gboxes, padding=max(0, self.box_padding))
-                    if roi is not None:
-                        m = _limit_mask_to_roi(m, roi, img.size)
-                    if not m.getbbox():
-                        continue
-                    tasks.append((gi, m))
-
+                roi = self._normalize_roi((self.roi_by_image or {}).get(src), img.size)
+                tasks = self._build_tasks(src, img, boxes_raw, roi)
                 if not tasks:
                     self.progress.emit(done, total)
                     continue
 
-                def _apply_crop_result(final_img, crop_res):
-                    if not crop_res:
-                        return
-                    crop_box, res_crop, crop_mask = crop_res
-                    try:
-                        blur_mask = crop_mask.filter(ImageFilter.GaussianBlur(3))
-                    except Exception:
-                        blur_mask = crop_mask
-                    orig_crop_area = final_img.crop(crop_box)
-                    blended = Image.composite(res_crop, orig_crop_area, blur_mask)
-                    final_img.paste(blended, (int(crop_box[0]), int(crop_box[1])))
+                local_results = []
+                remote_tasks = []
+                for task in tasks:
+                    strategy = str((task.get("analysis") or {}).get("strategy") or self.STRATEGY_REMOTE)
+                    if strategy == self.STRATEGY_REMOTE:
+                        remote_tasks.append(task)
+                        continue
+                    payload = self._crop_from_mask(img, task["mask"], crop_padding=max(0, self.crop_padding))
+                    if not payload:
+                        continue
+                    crop_box, crop_img, crop_mask = payload
+                    local_img = self._run_local_strategy(crop_img, crop_mask, task.get("analysis"))
+                    if local_img is None:
+                        remote_tasks.append(task)
+                        continue
+                    local_results.append((task["index"], (crop_box, local_img, crop_mask, task.get("overlays") or [], {"blur_radius": float(task.get("composite_blur", 3.0) or 0.0)})))
+
+                remote_results = self._run_remote_tasks(img, remote_tasks, list(self.api_urls or []))
+                if remote_results is None:
+                    canceled = True
+                    break
 
                 final = img.copy()
-                if len(tasks) == 1:
-                    gi, m = tasks[0]
-                    crop_res = call_api_crop(api_urls[int(gi) % len(api_urls)], img, m, crop_padding=max(0, self.crop_padding))
-                    _apply_crop_result(final, crop_res)
-                else:
-                    def worker(group_idx, mask_pil):
-                        # Try the assigned URL first; on failure, fall back to other URLs.
-                        start = int(group_idx) % len(api_urls)
-                        last_err = None
-                        for off in range(len(api_urls)):
-                            url = api_urls[(start + off) % len(api_urls)]
-                            try:
-                                return (int(group_idx), call_api_crop(url, img, mask_pil, crop_padding=max(0, self.crop_padding)))
-                            except Exception as e:
-                                last_err = e
-                                continue
-                        raise last_err or RuntimeError(_t_global("IOPaint 请求失败", "IOPaint request failed"))
+                for _, crop_res in sorted((local_results or []) + (remote_results or []), key=lambda t: t[0]):
+                    self._apply_crop_result(final, crop_res)
 
-                    results = []
-                    with ThreadPoolExecutor(max_workers=min(len(api_urls), len(tasks))) as ex:
-                        futs = [ex.submit(worker, gi, m) for gi, m in tasks]
-                        for fut in as_completed(futs):
-                            if self.isInterruptionRequested():
-                                canceled = True
-                                break
-                            gi, crop_res = fut.result()
-                            if crop_res:
-                                results.append((gi, crop_res))
-
-                    if canceled:
-                        break
-
-                    for gi, crop_res in sorted(results, key=lambda t: t[0]):
-                        _apply_crop_result(final, crop_res)
-
-                ts = int(time.time())
-                base = os.path.splitext(os.path.basename(src))[0]
-                # 清理文件名中的特殊字符，防止路径注入
-                safe_base = re.sub(r'[^\w\-.]', '_', base)
-                out_path = os.path.join(self.out_dir, f"inpaint_{safe_base}_{ts}.png")
-                final.save(out_path, "PNG")
-
+                out_path = self._save_result_image(src, final)
                 self.results.append((src, out_path))
                 self.finished_one.emit(src, out_path)
                 self.progress.emit(done, total)
@@ -1359,8 +2385,8 @@ class ShortcutsDialog(QDialog):
             ("Ctrl+Shift+O", self._t("导入PDF", "Import PDF")),
             ("Ctrl+Enter", self._t("OCR本页", "OCR current")),
             ("Ctrl+R", self._t("OCR全部", "OCR all")),
-            ("Ctrl+I", self._t("IOPaint去字（本页）", "IOPaint clean (current)")),
-            ("Ctrl+Shift+I", self._t("IOPaint去字（全部）", "IOPaint clean (all)")),
+            ("Ctrl+I", self._t("智能去字（本页）", "Smart clean (current)")),
+            ("Ctrl+Shift+I", self._t("智能去字（全部）", "Smart clean (all)")),
             ("Ctrl+S", self._t("导出PPT", "Export PPT")),
             ("F5", self._t("预览PPT", "Preview PPT")),
             ("Ctrl+N", self._t("新建空白页", "New blank slide")),
@@ -1674,6 +2700,27 @@ class CanvasTextBox(QGraphicsItemGroup):
             self.model["bg_color"] = None
         self.model["bg_alpha"] = int(self.bg_alpha)
 
+    def _clean_outline_pen(self):
+        color = QColor(180, 180, 180, 180)
+        if isinstance(self.model, dict):
+            enabled = bool(self.model.get("clean_enabled", True))
+            mode = InpaintThread._normalize_box_clean_mode(self.model.get("clean_mode"))
+            if not enabled:
+                color = QColor(185, 185, 185, 120)
+            elif mode == InpaintThread.MODE_FILL:
+                color = QColor(72, 140, 96, 200)
+            elif mode == InpaintThread.MODE_REMOTE:
+                color = QColor(67, 116, 196, 210)
+        return QPen(color, 1, Qt.DashLine)
+
+    def refresh_clean_outline(self):
+        try:
+            self.box.setPen(self._clean_outline_pen())
+            self.box.update()
+            self.update()
+        except Exception:
+            pass
+
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
             self._sync_model_geometry()
@@ -1788,7 +2835,7 @@ class CanvasTextBox(QGraphicsItemGroup):
             pass
 
         # 边框：不提供自定义边框设置，仅保留编辑时虚线轮廓
-        self.box.setPen(QPen(QColor(180, 180, 180, 180), 1, Qt.DashLine))
+        self.refresh_clean_outline()
 
         # 背景透明度（alpha:0-255）
         try:
@@ -1841,7 +2888,7 @@ class CanvasTextBox(QGraphicsItemGroup):
             for p in [r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()]:
                 painter.drawEllipse(p, 3, 3)
         else:
-            painter.setPen(QPen(QColor(220,220,220), 1, Qt.DashLine))
+            painter.setPen(self._clean_outline_pen())
             painter.drawRect(self.box.rect())
 
     def mousePressEvent(self, event):
@@ -1994,7 +3041,7 @@ class PPTCloneApp(QMainWindow):
         self.ocr_loading = False
 
         # PPT导出配置
-        self.use_text_bg = True  # 是否使用文本框背景色
+        self.use_text_bg = False  # 是否使用文本框背景色（默认关闭）
         self.text_bg_color = QColor(255, 255, 255)  # 默认白色背景
         # 默认透明度降低一些，避免在画布上遮住原图；导出前可在“视图-背景透明度”调高
         self.text_bg_alpha = DEFAULT_BG_ALPHA
@@ -2175,6 +3222,10 @@ class PPTCloneApp(QMainWindow):
             "inpaint_api_url": "http://127.0.0.1:8080/api/v1/inpaint",
             "inpaint_box_padding": 6,
             "inpaint_crop_padding": 128,
+            "inpaint_fill_pad_x": 10,
+            "inpaint_fill_pad_y": 6,
+            "inpaint_remote_pad_x": 8,
+            "inpaint_remote_pad_y": 4,
         }
         try:
             if os.path.exists(self.settings_path):
@@ -2428,17 +3479,17 @@ class PPTCloneApp(QMainWindow):
         dlg.exec()
 
     def open_inpaint_settings(self, *args):
-        """Settings dialog for IOPaint API used to remove non-editable text in the background."""
+        """Settings dialog for hybrid text removal used to clean the background."""
         from PySide6.QtWidgets import QDialog, QFormLayout, QLineEdit, QSpinBox
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(self._t("IOPaint 设置", "IOPaint Settings"))
+        dlg.setWindowTitle(self._t("去字设置", "Clean Background Settings"))
         dlg.setModal(True)
         dlg.setMinimumWidth(520)
 
         form = QFormLayout(dlg)
 
-        chk_enabled = QCheckBox(self._t("启用 IOPaint 去字（导出前可生成纯背景底图）", "Enable IOPaint clean background (before export)"))
+        chk_enabled = QCheckBox(self._t("启用去字功能（导出前可生成纯背景底图）", "Enable text clean background generation"))
         chk_enabled.setChecked(bool(self.settings.get("inpaint_enabled", True)))
         form.addRow(self._t("开关", "Enable"), chk_enabled)
 
@@ -2457,14 +3508,50 @@ class PPTCloneApp(QMainWindow):
         sp_crop_pad.setSuffix(" px")
         form.addRow(self._t("裁剪外扩（API加速）", "Crop padding (API speed-up)"), sp_crop_pad)
 
+        sp_fill_pad_x = QSpinBox()
+        sp_fill_pad_x.setRange(0, BOX_PADDING_MAX)
+        sp_fill_pad_x.setValue(int(self.settings.get("inpaint_fill_pad_x", 10) or 10))
+        sp_fill_pad_x.setSuffix(" px")
+        form.addRow(self._t("单色覆盖横向外扩", "Solid fill extra width"), sp_fill_pad_x)
+
+        sp_fill_pad_y = QSpinBox()
+        sp_fill_pad_y.setRange(0, BOX_PADDING_MAX)
+        sp_fill_pad_y.setValue(int(self.settings.get("inpaint_fill_pad_y", 6) or 6))
+        sp_fill_pad_y.setSuffix(" px")
+        form.addRow(self._t("单色覆盖纵向外扩", "Solid fill extra height"), sp_fill_pad_y)
+
+        sp_remote_pad_x = QSpinBox()
+        sp_remote_pad_x.setRange(0, BOX_PADDING_MAX)
+        sp_remote_pad_x.setValue(int(self.settings.get("inpaint_remote_pad_x", 8) or 8))
+        sp_remote_pad_x.setSuffix(" px")
+        form.addRow(self._t("IOPaint 横向外扩", "IOPaint extra width"), sp_remote_pad_x)
+
+        sp_remote_pad_y = QSpinBox()
+        sp_remote_pad_y.setRange(0, BOX_PADDING_MAX)
+        sp_remote_pad_y.setValue(int(self.settings.get("inpaint_remote_pad_y", 4) or 4))
+        sp_remote_pad_y.setSuffix(" px")
+        form.addRow(self._t("IOPaint 纵向外扩", "IOPaint extra height"), sp_remote_pad_y)
+
         tips = QLabel(self._t(
-            "说明：会根据 OCR 文本框生成遮罩（略外扩），调用 IOPaint API 修复得到纯背景。\n"
-            "支持多个 API 地址：用分号/逗号分隔（例如：url1;url2），可并行加速。\n"
+            "说明：会根据 OCR 文本框自动生成遮罩（优先使用 polygon），支持三种入口。\n"
+            "- 智能去字：简单背景优先单色覆盖，复杂纹理/照片区域自动使用 IOPaint\n"
+            "- 单色覆盖去字：直接提取周边主色覆盖文字，适合白底/纯色区域\n"
+            "- IOPaint 去字：强制调用 IOPaint，适合复杂纹理或用户明确指定的框\n"
+            "右侧可对单个 OCR 框设置“参与去字 / 去字方式”。\n"
+            "若单色覆盖仍有边缘残留，可增加“单色覆盖横向外扩 / 纵向外扩”；\n"
+            "若 IOPaint 仍有漏字，可增加“IOPaint 横向外扩 / 纵向外扩”。\n"
+            "支持多个 API 地址：用分号/逗号分隔（例如：url1;url2），复杂区域可并行加速。\n"
             "建议先在命令行启动服务：\n"
             "  iopaint start --host 127.0.0.1 --port 8080\n",
             "Notes:\n"
-            "- A mask is built from OCR boxes (with padding), then sent to IOPaint API.\n"
-            "- Multiple endpoints are supported: separate with ';' or ',' (e.g. url1;url2) for parallel speed-up.\n"
+            "- OCR boxes are converted to a mask automatically (polygon first).\n"
+            "- Smart clean uses solid color fill for simple regions, and IOPaint for complex textured/photo regions.\n"
+            "- Solid fill clean samples the nearby dominant background color and covers the text directly.\n"
+            "- IOPaint clean forces the remote API and is suitable for complex regions or boxes explicitly set to IOPaint.\n"
+            "- Each OCR box can be configured individually from the right-side panel.\n"
+            "- If solid fill leaves edge remnants, increase the solid fill extra width / height.\n"
+            "- If IOPaint still leaves text behind, increase the IOPaint extra width / height.\n"
+            "- Multiple endpoints are supported: separate with ';' or ',' (e.g. url1;url2) for complex-region parallel speed-up.\n"
             "- Start the service first:\n"
             "  iopaint start --host 127.0.0.1 --port 8080\n",
         ))
@@ -2486,6 +3573,10 @@ class PPTCloneApp(QMainWindow):
             self.settings["inpaint_api_url"] = (ed_url.text() or "").strip()
             self.settings["inpaint_box_padding"] = int(sp_box_pad.value())
             self.settings["inpaint_crop_padding"] = int(sp_crop_pad.value())
+            self.settings["inpaint_fill_pad_x"] = int(sp_fill_pad_x.value())
+            self.settings["inpaint_fill_pad_y"] = int(sp_fill_pad_y.value())
+            self.settings["inpaint_remote_pad_x"] = int(sp_remote_pad_x.value())
+            self.settings["inpaint_remote_pad_y"] = int(sp_remote_pad_y.value())
             self.save_settings()
             dlg.accept()
 
@@ -2699,11 +3790,29 @@ class PPTCloneApp(QMainWindow):
         except Exception:
             curr_idx = self.list_thumb.currentRow()
         return {
+            "kind": "full",
             "images": list(self.images),
             "box_data": copy.deepcopy(self.box_data),
             "inpaint_variants": dict(getattr(self, "inpaint_variants", {}) or {}),
             "show_inpaint_preview": bool(getattr(self, "show_inpaint_preview", False)),
             "roi_by_image": copy.deepcopy(getattr(self, "roi_by_image", {}) or {}),
+            "current_index": int(curr_idx) if curr_idx is not None else -1,
+        }
+
+    def _snapshot_current_slide_state(self, image_path=None):
+        image_path = image_path or self.current_img
+        if not image_path:
+            return self._snapshot_state()
+        try:
+            curr_idx = self.images.index(image_path)
+        except Exception:
+            curr_idx = self.list_thumb.currentRow()
+        roi_value = copy.deepcopy((getattr(self, "roi_by_image", {}) or {}).get(image_path))
+        return {
+            "kind": "slide",
+            "image_path": image_path,
+            "boxes": copy.deepcopy((self.box_data or {}).get(image_path, []) or []),
+            "roi": roi_value,
             "current_index": int(curr_idx) if curr_idx is not None else -1,
         }
 
@@ -2714,7 +3823,42 @@ class PPTCloneApp(QMainWindow):
             self.undo_stack.pop(0)
         self.redo_stack.clear()
 
+    def push_undo_current_slide(self, image_path=None):
+        """仅保存当前页状态，避免频繁编辑时深拷贝整个项目。"""
+        self.undo_stack.append(self._snapshot_current_slide_state(image_path=image_path))
+        if len(self.undo_stack) > 50:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def _snapshot_for_history_entry(self, entry):
+        kind = str((entry or {}).get("kind") or "full")
+        if kind == "slide":
+            return self._snapshot_current_slide_state(entry.get("image_path"))
+        return self._snapshot_state()
+
     def _restore_state(self, snap):
+        kind = str((snap or {}).get("kind") or "full")
+        if kind == "slide":
+            image_path = snap.get("image_path")
+            if image_path in self.images:
+                self.box_data[image_path] = copy.deepcopy(snap.get("boxes", []) or [])
+                roi_map = getattr(self, "roi_by_image", {}) or {}
+                roi_value = copy.deepcopy(snap.get("roi"))
+                if roi_value is None:
+                    roi_map.pop(image_path, None)
+                else:
+                    roi_map[image_path] = roi_value
+                self.roi_by_image = roi_map
+                idx = int(snap.get("current_index", -1))
+                if 0 <= idx < len(self.images):
+                    self.list_thumb.setCurrentRow(idx)
+                    self.switch_slide(idx)
+                elif self.current_img == image_path:
+                    try:
+                        self._rebuild_scene_keep_view()
+                    except Exception:
+                        self.switch_slide(self.list_thumb.currentRow())
+            return
         self.images = list(snap.get("images", []))
         self.box_data = snap.get("box_data", {}) or {}
         self.inpaint_variants = snap.get("inpaint_variants", {}) or {}
@@ -2730,15 +3874,15 @@ class PPTCloneApp(QMainWindow):
     def undo(self, *args):
         if not self.undo_stack:
             return
-        self.redo_stack.append(self._snapshot_state())
         snap = self.undo_stack.pop()
+        self.redo_stack.append(self._snapshot_for_history_entry(snap))
         self._restore_state(snap)
 
     def redo(self, *args):
         if not self.redo_stack:
             return
-        self.undo_stack.append(self._snapshot_state())
         snap = self.redo_stack.pop()
+        self.undo_stack.append(self._snapshot_for_history_entry(snap))
         self._restore_state(snap)
 
     def init_ui(self):
@@ -2814,15 +3958,31 @@ class PPTCloneApp(QMainWindow):
         self.act_ocr_all.triggered.connect(self.run_ocr_all_images)
         self.addAction(self.act_ocr_all)
 
-        self.act_inpaint_current = QAction(self._t("IOPaint去字本页", "IOPaint Clean (Current)"), self)
+        self.act_inpaint_current = QAction(self._t("智能去字本页", "Smart Clean (Current)"), self)
         self.act_inpaint_current.setShortcut(QKeySequence("Ctrl+I"))
         self.act_inpaint_current.triggered.connect(self.inpaint_current_slide)
         self.addAction(self.act_inpaint_current)
 
-        self.act_inpaint_all = QAction(self._t("IOPaint去字全部", "IOPaint Clean (All)"), self)
+        self.act_inpaint_all = QAction(self._t("智能去字全部", "Smart Clean (All)"), self)
         self.act_inpaint_all.setShortcut(QKeySequence("Ctrl+Shift+I"))
         self.act_inpaint_all.triggered.connect(self.inpaint_all_slides)
         self.addAction(self.act_inpaint_all)
+
+        self.act_fill_current = QAction(self._t("单色覆盖去字本页", "Solid Fill Clean (Current)"), self)
+        self.act_fill_current.triggered.connect(self.fill_current_slide)
+        self.addAction(self.act_fill_current)
+
+        self.act_fill_all = QAction(self._t("单色覆盖去字全部", "Solid Fill Clean (All)"), self)
+        self.act_fill_all.triggered.connect(self.fill_all_slides)
+        self.addAction(self.act_fill_all)
+
+        self.act_remote_current = QAction(self._t("IOPaint去字本页", "IOPaint Clean (Current)"), self)
+        self.act_remote_current.triggered.connect(self.remote_inpaint_current_slide)
+        self.addAction(self.act_remote_current)
+
+        self.act_remote_all = QAction(self._t("IOPaint去字全部", "IOPaint Clean (All)"), self)
+        self.act_remote_all.triggered.connect(self.remote_inpaint_all_slides)
+        self.addAction(self.act_remote_all)
 
         # Inpaint compare / ROI tools
         self.act_toggle_inpaint_preview = QAction(self._t("切换去字预览（原图/去字）", "Toggle Clean Preview (Orig/Clean)"), self)
@@ -3070,30 +4230,60 @@ class PPTCloneApp(QMainWindow):
 
         lay_home.addWidget(RibbonSeparator())
 
-        # --- Group: IOPaint 去字（生成纯背景底图） ---
-        grp_inpaint = RibbonGroup(self._t("IOPaint去字", "IOPaint"))
-        btn_inpaint_cur = RibbonLargeBtn(self._t("去字\n本页", "Clean\nCurrent"), "fa5s.eraser", color=PPT_THEME_RED)
+        # --- Group: 去字（按模式生成纯背景底图） ---
+        grp_inpaint = RibbonGroup(self._t("去字", "Clean"))
+        btn_inpaint_cur = RibbonLargeBtn(self._t("智能\n本页", "Smart\nCurrent"), "fa5s.magic", color=PPT_THEME_RED)
         btn_inpaint_cur.clicked.connect(self.inpaint_current_slide)
-        btn_inpaint_all = RibbonLargeBtn(self._t("去字\n全部", "Clean\nAll"), "fa5s.eraser", color=PPT_THEME_RED)
+        btn_inpaint_all = RibbonLargeBtn(self._t("智能\n全部", "Smart\nAll"), "fa5s.magic", color=PPT_THEME_RED)
         btn_inpaint_all.clicked.connect(self.inpaint_all_slides)
 
-        self.btn_inpaint_preview = RibbonLargeBtn(self._t("去字\n预览", "Preview\nClean"), "fa5s.adjust", color=PPT_THEME_RED)
+        mode_ops = QWidget()
+        mode_ops_layout = QGridLayout(mode_ops)
+        mode_ops_layout.setContentsMargins(0, 2, 0, 0)
+        mode_ops_layout.setHorizontalSpacing(2)
+        mode_ops_layout.setVerticalSpacing(2)
+
+        btn_fill_cur = RibbonSmallBtn(self._t("单色本页", "Fill Cur"), "fa5s.paint-brush")
+        btn_fill_cur.clicked.connect(self.fill_current_slide)
+        mode_ops_layout.addWidget(btn_fill_cur, 0, 0, 1, 1)
+
+        btn_fill_all = RibbonSmallBtn(self._t("单色全部", "Fill All"), "fa5s.paint-brush")
+        btn_fill_all.clicked.connect(self.fill_all_slides)
+        mode_ops_layout.addWidget(btn_fill_all, 1, 0, 1, 1)
+
+        btn_remote_cur = RibbonSmallBtn(self._t("IOP本页", "IOP Cur"), "fa5s.eraser")
+        btn_remote_cur.clicked.connect(self.remote_inpaint_current_slide)
+        mode_ops_layout.addWidget(btn_remote_cur, 0, 1, 1, 1)
+
+        btn_remote_all = RibbonSmallBtn(self._t("IOP全部", "IOP All"), "fa5s.eraser")
+        btn_remote_all.clicked.connect(self.remote_inpaint_all_slides)
+        mode_ops_layout.addWidget(btn_remote_all, 1, 1, 1, 1)
+
+        preview_ops = QWidget()
+        preview_ops_layout = QVBoxLayout(preview_ops)
+        preview_ops_layout.setContentsMargins(0, 2, 0, 0)
+        preview_ops_layout.setSpacing(2)
+
+        self.btn_inpaint_preview = RibbonSmallBtn(self._t("预览切换", "Preview"), "fa5s.adjust")
         self.btn_inpaint_preview.setToolTip(self._t("勾选：显示去字底图；取消：显示原图（便于对比） (Ctrl+Alt+B)", "Checked: show cleaned background; unchecked: original (Ctrl+Alt+B)"))
         self.btn_inpaint_preview.setCheckable(True)
         self.btn_inpaint_preview.setStyleSheet(
-            "QToolButton { font-size: 11px; padding-top: 4px; }"
+            "QToolButton { font-size: 11px; text-align: left; padding-left: 5px; }"
             "\nQToolButton:checked { background: #D24726; color: white; border-radius: 4px; }"
         )
         self.btn_inpaint_preview.toggled.connect(self.set_inpaint_preview)
+        preview_ops_layout.addWidget(self.btn_inpaint_preview)
 
-        btn_inpaint_restore = RibbonLargeBtn(self._t("恢复\n原图", "Restore\nOrig"), "fa5s.history", color=PPT_THEME_RED)
+        btn_inpaint_restore = RibbonSmallBtn(self._t("恢复原图", "Restore"), "fa5s.history")
         btn_inpaint_restore.setToolTip(self._t("清除本页去字底图（恢复原图） (Ctrl+Alt+Shift+B)", "Clear cleaned background for this slide (Ctrl+Alt+Shift+B)"))
         btn_inpaint_restore.clicked.connect(self.clear_inpaint_variant_current)
+        preview_ops_layout.addWidget(btn_inpaint_restore)
+        preview_ops_layout.addStretch()
 
         grp_inpaint.add_widget(btn_inpaint_cur)
         grp_inpaint.add_widget(btn_inpaint_all)
-        grp_inpaint.add_widget(self.btn_inpaint_preview)
-        grp_inpaint.add_widget(btn_inpaint_restore)
+        grp_inpaint.add_widget(mode_ops)
+        grp_inpaint.add_widget(preview_ops)
         lay_home.addWidget(grp_inpaint)
 
         # >>>>> 插入分隔线 4 (末尾) <<<<<
@@ -3235,7 +4425,7 @@ class PPTCloneApp(QMainWindow):
         btn_ocr_settings.clicked.connect(self.open_ocr_settings)
         btn_reload_ocr = RibbonLargeBtn(self._t("重新加载\nOCR", "Reload\nOCR"), "fa5s.sync", color=PPT_THEME_RED)
         btn_reload_ocr.clicked.connect(self.force_reload_ocr_engine)
-        btn_inpaint_settings = RibbonLargeBtn(self._t("IOPaint\n设置", "IOPaint\nSettings"), "fa5s.eraser", color=PPT_THEME_RED)
+        btn_inpaint_settings = RibbonLargeBtn(self._t("去字\n设置", "Clean\nSettings"), "fa5s.eraser", color=PPT_THEME_RED)
         btn_inpaint_settings.clicked.connect(self.open_inpaint_settings)
         grp_settings.add_widget(btn_ocr_settings)
         grp_settings.add_widget(btn_reload_ocr)
@@ -3576,6 +4766,29 @@ class PPTCloneApp(QMainWindow):
         l.addWidget(self.slider_bg_alpha)
         l.addSpacing(10)
 
+        l.addWidget(QLabel(self._t("去字设置:", "Clean mode:")))
+        clean_container = QWidget()
+        clean_layout = QGridLayout(clean_container)
+        clean_layout.setContentsMargins(0, 0, 0, 0)
+        clean_layout.setHorizontalSpacing(6)
+        clean_layout.setVerticalSpacing(6)
+
+        self.chk_clean_enabled = QCheckBox(self._t("参与去字", "Include in clean"))
+        self.chk_clean_enabled.stateChanged.connect(self.toggle_selected_clean_enabled)
+        self.chk_clean_enabled.setEnabled(False)
+        clean_layout.addWidget(self.chk_clean_enabled, 0, 0, 1, 1)
+
+        self.cmb_clean_mode = QComboBox()
+        self.cmb_clean_mode.addItem(self._t("智能判断", "Smart"), InpaintThread.MODE_AUTO)
+        self.cmb_clean_mode.addItem(self._t("单色覆盖", "Solid fill"), InpaintThread.MODE_FILL)
+        self.cmb_clean_mode.addItem(self._t("IOPaint", "IOPaint"), InpaintThread.MODE_REMOTE)
+        self.cmb_clean_mode.currentIndexChanged.connect(self.change_selected_clean_mode)
+        self.cmb_clean_mode.setEnabled(False)
+        clean_layout.addWidget(self.cmb_clean_mode, 0, 1, 1, 1)
+        clean_layout.setColumnStretch(1, 1)
+        l.addWidget(clean_container)
+        l.addSpacing(10)
+
         # 右侧面板不再提供“边框”设置（仅保留编辑时的虚线选中框）
 
         self.btn_apply_style_page = QPushButton(self._t("应用样式到本页全部文本框", "Apply style to all boxes (slide)"))
@@ -3617,7 +4830,7 @@ class PPTCloneApp(QMainWindow):
 
         for original_path in images:
             try:
-                img = cv2.imread(original_path)
+                img = _imread_any(original_path)
                 if img is None:
                     continue
 
@@ -3643,9 +4856,9 @@ class PPTCloneApp(QMainWindow):
                 scaled_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
                 # 保存到临时目录
-                filename = os.path.basename(original_path)
-                scaled_path = os.path.join(self.temp_dir, f"scaled_{filename}")
-                cv2.imwrite(scaled_path, scaled_img)
+                scaled_path = build_asset_path(self.temp_dir, "scaled", original_path, ext=".png")
+                if not _imwrite_any(scaled_path, scaled_img):
+                    raise RuntimeError("无法写入缩放后的临时图片")
 
                 self.scaled_images[original_path] = scaled_path
 
@@ -3718,7 +4931,6 @@ class PPTCloneApp(QMainWindow):
             # Render scale: 2x (approx 144 DPI on a 72 DPI base), good balance for OCR.
             zoom = 2.0
             for pdf_path, doc in docs:
-                base = os.path.splitext(os.path.basename(pdf_path))[0]
                 for page_index in range(int(doc.page_count or 0)):
                     if progress.wasCanceled():
                         canceled = True
@@ -3726,8 +4938,13 @@ class PPTCloneApp(QMainWindow):
                     try:
                         page = doc.load_page(page_index)
                         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-                        out_name = f"pdf_{base}_{stamp}_p{page_index+1:04d}.png"
-                        out_path = os.path.join(self.slide_assets_dir, out_name)
+                        out_path = build_asset_path(
+                            self.slide_assets_dir,
+                            "pdf",
+                            pdf_path,
+                            suffix=f"{stamp}_p{page_index+1:04d}",
+                            ext=".png",
+                        )
                         pix.save(out_path)
                         self._add_image_item(out_path)
                     except Exception as e:
@@ -3759,15 +4976,7 @@ class PPTCloneApp(QMainWindow):
             QMessageBox.warning(
                 self,
                 self._t("提示", "Info"),
-                self._t("IOPaint 去字功能已在设置中关闭", "IOPaint is disabled in Settings."),
-            )
-            return False
-        api_urls = parse_inpaint_api_urls(self.settings.get("inpaint_api_url"))
-        if not api_urls:
-            QMessageBox.warning(
-                self,
-                self._t("提示", "Info"),
-                self._t("请先在【设置】里填写 IOPaint API 地址", "Please set the IOPaint API URL in Settings first."),
+                self._t("去字功能已在设置中关闭", "Background cleaning is disabled in Settings."),
             )
             return False
         return True
@@ -3795,47 +5004,114 @@ class PPTCloneApp(QMainWindow):
         except Exception:
             pass
 
-    def inpaint_current_slide(self, *args):
-        """IOPaint：对当前页按 OCR 文本框去字，生成纯背景底图（替换当前图片）。"""
-        if not self.images or not self.current_img:
-            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
-            return
-        if not self._ensure_inpaint_ready():
-            return
-        if not (self.box_data.get(self.current_img) or []):
-            QMessageBox.warning(
-                self,
-                self._t("提示", "Info"),
-                self._t("当前页没有文本框数据，请先运行 OCR 识别", "No OCR boxes on this slide. Run OCR first."),
-            )
-            return
+    def _clean_mode_meta(self, run_mode):
+        run_mode = InpaintThread._normalize_run_mode(run_mode)
+        if run_mode == InpaintThread.RUN_FILL:
+            return {
+                "title": self._t("单色覆盖去字", "Solid Fill Clean"),
+                "progress": self._t("正在单色覆盖去字...", "Applying solid fill clean..."),
+            }
+        if run_mode == InpaintThread.RUN_REMOTE:
+            return {
+                "title": self._t("IOPaint去字", "IOPaint Clean"),
+                "progress": self._t("正在调用 IOPaint 去字...", "Cleaning with IOPaint..."),
+            }
+        return {
+            "title": self._t("智能去字", "Smart Clean"),
+            "progress": self._t("正在智能去字...", "Cleaning background..."),
+        }
 
-        self._run_inpaint([self.current_img])
+    def _collect_clean_targets(self, images_to_run):
+        count = 0
+        explicit_remote = False
+        for img_path in images_to_run or []:
+            for box in self.box_data.get(img_path, []) or []:
+                if not isinstance(box, dict):
+                    continue
+                if InpaintThread._extract_rect(box) is None:
+                    continue
+                if not bool(box.get("clean_enabled", True)):
+                    continue
+                count += 1
+                if InpaintThread._normalize_box_clean_mode(box.get("clean_mode")) == InpaintThread.MODE_REMOTE:
+                    explicit_remote = True
+        return count, explicit_remote
 
-    def inpaint_all_slides(self, *args):
-        """IOPaint：批量对全部图片页按 OCR 文本框去字。"""
+    def _start_clean_run(self, images_to_run, run_mode):
         if not self.images:
             QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
             return
         if not self._ensure_inpaint_ready():
             return
-        if not any(self.box_data.get(p) for p in self.images):
+
+        try:
+            images_to_run = [p for p in images_to_run if p]
+        except Exception:
+            images_to_run = []
+        if not images_to_run:
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("没有可处理的图片", "No images to process."))
+            return
+
+        cleanable_count, explicit_remote = self._collect_clean_targets(images_to_run)
+        if cleanable_count <= 0:
             QMessageBox.warning(
                 self,
                 self._t("提示", "Info"),
-                self._t("没有文本框数据，请先运行 OCR 识别", "No OCR boxes found. Run OCR first."),
+                self._t("没有启用的去字框，请先运行 OCR 或勾选“参与去字”。", "No enabled OCR boxes for cleaning. Run OCR first or enable 'Include in clean'."),
             )
             return
 
-        self._run_inpaint(list(self.images))
+        run_mode = InpaintThread._normalize_run_mode(run_mode)
+        strict_remote = bool(run_mode == InpaintThread.RUN_REMOTE or (run_mode == InpaintThread.RUN_SMART and explicit_remote))
+        api_urls = parse_inpaint_api_urls(self.settings.get("inpaint_api_url"))
+        if strict_remote and not api_urls:
+            QMessageBox.warning(
+                self,
+                self._t("提示", "Info"),
+                self._t("当前操作包含强制 IOPaint 去字，但还没有配置可用的 IOPaint API 地址。", "This action requires IOPaint, but no IOPaint API URL is configured."),
+            )
+            return
 
-    def _run_inpaint(self, images_to_run):
+        self._run_inpaint(images_to_run, run_mode=run_mode)
+
+    def inpaint_current_slide(self, *args):
+        """智能去字：优先单色覆盖，复杂区域或显式指定时调用 IOPaint。"""
+        if not self.current_img:
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
+            return
+        self._start_clean_run([self.current_img], run_mode=InpaintThread.RUN_SMART)
+
+    def inpaint_all_slides(self, *args):
+        """智能去字：批量处理全部图片页。"""
+        self._start_clean_run(list(self.images), run_mode=InpaintThread.RUN_SMART)
+
+    def fill_current_slide(self, *args):
+        if not self.current_img:
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
+            return
+        self._start_clean_run([self.current_img], run_mode=InpaintThread.RUN_FILL)
+
+    def fill_all_slides(self, *args):
+        self._start_clean_run(list(self.images), run_mode=InpaintThread.RUN_FILL)
+
+    def remote_inpaint_current_slide(self, *args):
+        if not self.current_img:
+            QMessageBox.warning(self, self._t("提示", "Info"), self._t("请先导入图片", "Please import images first."))
+            return
+        self._start_clean_run([self.current_img], run_mode=InpaintThread.RUN_REMOTE)
+
+    def remote_inpaint_all_slides(self, *args):
+        self._start_clean_run(list(self.images), run_mode=InpaintThread.RUN_REMOTE)
+
+    def _run_inpaint(self, images_to_run, run_mode=InpaintThread.RUN_SMART):
         try:
             images_to_run = [p for p in images_to_run if p]
         except Exception:
             images_to_run = []
         if not images_to_run:
             return
+        run_mode = InpaintThread._normalize_run_mode(run_mode)
+        mode_meta = self._clean_mode_meta(run_mode)
 
         # Avoid concurrent inpaint runs (can confuse UI state / overwrite progress dialogs).
         try:
@@ -3844,7 +5120,7 @@ class PPTCloneApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     self._t("提示", "Info"),
-                    self._t("IOPaint 去字正在运行，请先等待完成或取消。", "IOPaint is running. Please wait or cancel first."),
+                    self._t("去字任务正在运行，请先等待完成或取消。", "A clean task is already running. Please wait or cancel first."),
                 )
                 return
         except Exception:
@@ -3853,20 +5129,21 @@ class PPTCloneApp(QMainWindow):
         # Snapshot for undo
         self.push_undo()
 
-        api_urls = parse_inpaint_api_urls(self.settings.get("inpaint_api_url"))
+        api_urls = [] if run_mode == InpaintThread.RUN_FILL else parse_inpaint_api_urls(self.settings.get("inpaint_api_url"))
         api_url_hint = "\n".join(api_urls)
         box_pad = int(self.settings.get("inpaint_box_padding", 6) or 6)
         crop_pad = int(self.settings.get("inpaint_crop_padding", 128) or 128)
+        fill_pad_x = int(self.settings.get("inpaint_fill_pad_x", 10) or 0)
+        fill_pad_y = int(self.settings.get("inpaint_fill_pad_y", 6) or 0)
+        remote_pad_x = int(self.settings.get("inpaint_remote_pad_x", 8) or 0)
+        remote_pad_y = int(self.settings.get("inpaint_remote_pad_y", 4) or 0)
 
-        # Inpaint should operate on what the user currently sees (original vs inpaint preview),
-        # so that users can iteratively refine an already-inpainted page by selecting ROI and running again.
-        try:
-            input_image_by_src = {p: self._get_display_image_path(p) for p in images_to_run}
-        except Exception:
-            input_image_by_src = {}
+        # Always start from the original slide image. Re-running on an already-cleaned preview
+        # compounds artifacts and makes OCR masks drift from the true background.
+        input_image_by_src = {}
 
-        progress = QProgressDialog(self._t("正在调用 IOPaint 去字...", "Calling IOPaint..."), self._t("取消", "Cancel"), 0, len(images_to_run), self)
-        progress.setWindowTitle(self._t("IOPaint 去字", "IOPaint Clean"))
+        progress = QProgressDialog(mode_meta["progress"], self._t("取消", "Cancel"), 0, len(images_to_run), self)
+        progress.setWindowTitle(mode_meta["title"])
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
@@ -3881,6 +5158,11 @@ class PPTCloneApp(QMainWindow):
             input_image_by_src=input_image_by_src,
             roi_by_image=getattr(self, "roi_by_image", {}) or {},
             timeout_sec=120,
+            run_mode=run_mode,
+            fill_pad_x=fill_pad_x,
+            fill_pad_y=fill_pad_y,
+            remote_pad_x=remote_pad_x,
+            remote_pad_y=remote_pad_y,
         )
         progress.canceled.connect(self.inpaint_thread.requestInterruption)
         # 显式使用 QueuedConnection 确保跨线程信号在主线程中处理
@@ -3898,13 +5180,25 @@ class PPTCloneApp(QMainWindow):
                 progress.close()
             except Exception:
                 pass
+            if run_mode == InpaintThread.RUN_FILL:
+                extra = self._t(
+                    "请检查 OCR 遮罩框是否正确，以及原图是否可正常读取。",
+                    "Please check the OCR masks and make sure the source image can be read correctly.",
+                )
+            else:
+                extra = self._t(
+                    "请确认 IOPaint 服务已启动，并且 API 地址正确。",
+                    "Please make sure the IOPaint service is running and the API URL is correct.",
+                )
+                if api_url_hint:
+                    extra = self._t(
+                        f"{extra}\n{api_url_hint}",
+                        f"{extra}\n{api_url_hint}",
+                    )
             QMessageBox.critical(
                 self,
-                self._t("IOPaint 失败", "IOPaint failed"),
-                self._t(
-                    f"{msg}\n\n请确认 IOPaint 服务已启动，并且 API 地址正确：\n{api_url_hint}",
-                    f"{msg}\n\nPlease make sure the IOPaint service is running and the API URL is correct:\n{api_url_hint}",
-                ),
+                self._t("去字失败", "Clean failed"),
+                f"{msg}\n\n{extra}",
             )
 
         def on_done(canceled: bool):
@@ -3919,7 +5213,7 @@ class PPTCloneApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     self._t("提示", "Info"),
-                    self._t("已取消 IOPaint 去字", "IOPaint canceled."),
+                    self._t("已取消当前去字任务", "The current clean task was canceled."),
                 )
 
         self.inpaint_thread.error.connect(on_error, Qt.QueuedConnection)
@@ -3999,6 +5293,7 @@ class PPTCloneApp(QMainWindow):
     def new_blank_slide(self, *args):
         """新建一个空白图层（作为普通图片页处理）"""
         try:
+            import time
             self.push_undo()
             # 默认用 1920x1080；若已有当前页则复用当前尺寸
             w, h = 1920, 1080
@@ -4008,10 +5303,15 @@ class PPTCloneApp(QMainWindow):
                     w, h = max(1, pix.width()), max(1, pix.height())
 
             import numpy as np
-            import cv2
             blank = np.ones((h, w, 3), dtype=np.uint8) * 255
-            out_path = os.path.join(self.slide_assets_dir, f"blank_{len(self.images)+1}_{w}x{h}.png")
-            cv2.imwrite(out_path, blank)
+            out_path = build_asset_path(
+                self.slide_assets_dir,
+                "blank",
+                f"blank_{len(self.images)+1}_{w}x{h}_{int(time.time() * 1000)}",
+                ext=".png",
+            )
+            if not _imwrite_any(out_path, blank):
+                raise RuntimeError(self._t("无法创建空白页图片", "Failed to create blank slide image"))
 
             self._add_image_item(out_path)
             self.update_status()
@@ -4054,9 +5354,16 @@ class PPTCloneApp(QMainWindow):
             return
 
         self.push_undo()
-        base = os.path.basename(src)
-        name, ext = os.path.splitext(base)
-        dst = os.path.join(self.slide_assets_dir, f"dup_{len(self.images)+1}_{name}{ext or '.png'}")
+        import time
+
+        _, ext = os.path.splitext(src)
+        dst = build_asset_path(
+            self.slide_assets_dir,
+            "dup",
+            src,
+            suffix=str(int(time.time() * 1000)),
+            ext=ext or ".png",
+        )
         try:
             shutil.copyfile(src, dst)
         except Exception as e:
@@ -4102,11 +5409,15 @@ class PPTCloneApp(QMainWindow):
         x = max(0, (w - box_w) // 2)
         y = max(0, (h - box_h) // 2)
 
-        self.push_undo()
+        self.push_undo_current_slide()
         model = {
             "rect": [int(x), int(y), int(box_w), int(box_h)],
             "text": self._t("文本框", "Text Box"),
             "confidence": 1.0,
+            "clean_enabled": True,
+            "clean_mode": InpaintThread.MODE_AUTO,
+            "text_color_auto": False,
+            "text_color_manual": True,
             "use_custom_bg": False,
             "bg_color": None,
             "bg_alpha": 120,
@@ -4188,10 +5499,20 @@ class PPTCloneApp(QMainWindow):
         try:
             import time
             stamp = int(time.time())
-            out_path = os.path.join(self.slide_assets_dir, f"clipboard_{stamp}.png")
+            out_path = build_asset_path(
+                self.slide_assets_dir,
+                "clipboard",
+                f"clipboard_{stamp}",
+                ext=".png",
+            )
             ok = img.save(out_path, "PNG")
             if not ok:
-                out_path = os.path.join(self.slide_assets_dir, f"clipboard_{stamp}.jpg")
+                out_path = build_asset_path(
+                    self.slide_assets_dir,
+                    "clipboard",
+                    f"clipboard_{stamp}",
+                    ext=".jpg",
+                )
                 ok = img.save(out_path, "JPG")
             if not ok or not os.path.exists(out_path):
                 QMessageBox.warning(self, self._t("提示", "Info"), self._t("从剪贴板保存图片失败", "Failed to save clipboard image."))
@@ -4234,7 +5555,7 @@ class PPTCloneApp(QMainWindow):
         if pix.isNull():
             return
 
-        self.push_undo()
+        self.push_undo_current_slide()
         model = copy.deepcopy(self._clipboard_box)
         rect = model.get("rect", [0, 0, 120, 50])
         if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
@@ -4249,6 +5570,8 @@ class PPTCloneApp(QMainWindow):
         y = min(max(0, y + dy), max(0, pix.height() - bh))
         model["rect"] = [x, y, bw, bh]
 
+        model.setdefault("clean_enabled", True)
+        model.setdefault("clean_mode", InpaintThread.MODE_AUTO)
         model.setdefault("use_custom_bg", False)
         model.setdefault("bg_color", None)
 
@@ -4280,9 +5603,8 @@ class PPTCloneApp(QMainWindow):
 
         if scaled_path != image_path:
             # 读取原图和缩放图的尺寸
-            import cv2
-            original_img = cv2.imread(image_path)
-            scaled_img = cv2.imread(scaled_path)
+            original_img = _imread_any(image_path)
+            scaled_img = _imread_any(scaled_path)
 
             if original_img is not None and scaled_img is not None:
                 orig_h, orig_w = original_img.shape[:2]
@@ -4316,6 +5638,10 @@ class PPTCloneApp(QMainWindow):
 
         for r in results:
             if isinstance(r, dict):
+                r.setdefault("clean_enabled", True)
+                r.setdefault("clean_mode", InpaintThread.MODE_AUTO)
+                r.setdefault("text_color_auto", True)
+                r.setdefault("text_color_manual", False)
                 r.setdefault("use_custom_bg", False)
                 r.setdefault("bg_color", None)  # [r,g,b] or None
                 r.setdefault("bg_alpha", 120)
@@ -4329,29 +5655,9 @@ class PPTCloneApp(QMainWindow):
                 if original_img is not None and "rect" in r:
                     extracted_color = extract_text_color_from_region(original_img, r["rect"])
                 if extracted_color:
-                    q_rgb, q_name = quantize_text_color_basic(extracted_color)
                     # Keep a record of the raw color for debugging/tuning.
                     r.setdefault("text_color_raw", extracted_color)
-                    if q_rgb:
-                        r.setdefault("text_color", q_rgb)
-                        r.setdefault("text_color_name", q_name)
-                        try:
-                            key_map = {
-                                "黑": "black",
-                                "白": "white",
-                                "红": "red",
-                                "橙": "orange",
-                                "黄": "yellow",
-                                "绿": "green",
-                                "青": "cyan",
-                                "蓝": "blue",
-                                "紫": "purple",
-                            }
-                            r.setdefault("text_color_key", key_map.get(str(q_name), None))
-                        except Exception:
-                            pass
-                    else:
-                        r.setdefault("text_color", extracted_color)
+                    normalize_box_text_color_fields(r)
                 else:
                     r.setdefault("text_color", [0, 0, 0])
 
@@ -4408,10 +5714,18 @@ class PPTCloneApp(QMainWindow):
         # 右侧面板状态重置（避免切换页后仍显示上一个框的自定义设置）
         self._reset_right_panel_state()
         self.scene.clear()
+        try:
+            self._refresh_auto_text_colors_for_image(self.current_img)
+        except Exception:
+            pass
         pix = QPixmap(self._get_display_image_path(self.current_img))
         self._current_pixmap = pix
         self._build_scene_background(pix)
         for i, b in enumerate(self.box_data.get(self.current_img, [])):
+            try:
+                normalize_box_text_color_fields(b)
+            except Exception:
+                pass
             self.scene.addItem(CanvasTextBox(b, "", i, self))
         self._draw_roi_overlay()
         self.scene.setSceneRect(-50, -50, pix.width()+100, pix.height()+100)
@@ -4424,8 +5738,39 @@ class PPTCloneApp(QMainWindow):
             self.chk_custom_bg.blockSignals(True)
             self.chk_custom_bg.setChecked(False)
             self.chk_custom_bg.blockSignals(False)
+        if hasattr(self, "chk_clean_enabled") and self.chk_clean_enabled is not None:
+            self.chk_clean_enabled.blockSignals(True)
+            self.chk_clean_enabled.setChecked(True)
+            self.chk_clean_enabled.blockSignals(False)
+        if hasattr(self, "cmb_clean_mode") and self.cmb_clean_mode is not None:
+            idx = self.cmb_clean_mode.findData(InpaintThread.MODE_AUTO)
+            self.cmb_clean_mode.blockSignals(True)
+            self.cmb_clean_mode.setCurrentIndex(0 if idx < 0 else idx)
+            self.cmb_clean_mode.blockSignals(False)
         # 需要禁用的按钮/控件列表
         self._enable_right_panel_widgets(False)
+
+    def _refresh_auto_text_colors_for_image(self, image_path):
+        if not image_path:
+            return
+        boxes = self.box_data.get(image_path, []) or []
+        candidates = [b for b in boxes if isinstance(b, dict) and should_auto_refresh_text_color(b)]
+        if not candidates:
+            return
+        original_img = _imread_any(image_path)
+        if original_img is None:
+            return
+        for box in candidates:
+            rect = box.get("rect")
+            if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
+                continue
+            try:
+                extracted_color = extract_text_color_from_region(original_img, rect)
+            except Exception:
+                extracted_color = None
+            if extracted_color:
+                box["text_color_raw"] = [int(v) for v in extracted_color]
+                normalize_box_text_color_fields(box)
 
     def _enable_right_panel_widgets(self, enabled: bool):
         """批量启用/禁用右侧面板中与文本框属性相关的控件"""
@@ -4438,6 +5783,8 @@ class PPTCloneApp(QMainWindow):
             "btn_align_center",
             "btn_align_right",
             "slider_bg_alpha",
+            "chk_clean_enabled",
+            "cmb_clean_mode",
             "btn_apply_style_page",
         ]
         for name in widgets_to_toggle:
@@ -4706,6 +6053,22 @@ class PPTCloneApp(QMainWindow):
         except Exception:
             pass
 
+        try:
+            self.chk_clean_enabled.blockSignals(True)
+            self.chk_clean_enabled.setChecked(bool(m.get("clean_enabled", True)))
+            self.chk_clean_enabled.blockSignals(False)
+        except Exception:
+            pass
+
+        try:
+            mode = InpaintThread._normalize_box_clean_mode(m.get("clean_mode"))
+            idx = self.cmb_clean_mode.findData(mode)
+            self.cmb_clean_mode.blockSignals(True)
+            self.cmb_clean_mode.setCurrentIndex(0 if idx < 0 else idx)
+            self.cmb_clean_mode.blockSignals(False)
+        except Exception:
+            pass
+
         # 注意：边框相关控件已移除，不再同步边框设置
 
     def _apply_selected_style(self):
@@ -4732,8 +6095,10 @@ class PPTCloneApp(QMainWindow):
             initial = QColor(0, 0, 0)
         color = QColorDialog.getColor(initial, self, self._t("选择文字颜色", "Choose text color"))
         if color.isValid():
-            self.push_undo()
+            self.push_undo_current_slide()
             m["text_color"] = [color.red(), color.green(), color.blue()]
+            m["text_color_auto"] = False
+            m["text_color_manual"] = True
             self.refresh_right_panel_from_selected()
             self._apply_selected_style()
 
@@ -4741,7 +6106,7 @@ class PPTCloneApp(QMainWindow):
         m = self._get_selected_model()
         if not m:
             return
-        self.push_undo()
+        self.push_undo_current_slide()
         m["bold"] = bool(state)
         self._apply_selected_style()
 
@@ -4749,7 +6114,7 @@ class PPTCloneApp(QMainWindow):
         m = self._get_selected_model()
         if not m:
             return
-        self.push_undo()
+        self.push_undo_current_slide()
         m["align"] = align
         self._apply_selected_style()
 
@@ -4771,6 +6136,30 @@ class PPTCloneApp(QMainWindow):
                 self.slider_bg_alpha.isSliderDown()):
             self._schedule_scene_rebuild()
 
+    def toggle_selected_clean_enabled(self, state):
+        m = self._get_selected_model()
+        if not m:
+            return
+        enabled = bool(state)
+        if bool(m.get("clean_enabled", True)) == enabled:
+            return
+        self.push_undo_current_slide()
+        m["clean_enabled"] = enabled
+        if self.selected_box and isinstance(self.selected_box, CanvasTextBox):
+            self.selected_box.refresh_clean_outline()
+
+    def change_selected_clean_mode(self, *_args):
+        m = self._get_selected_model()
+        if not m:
+            return
+        mode = InpaintThread._normalize_box_clean_mode(self.cmb_clean_mode.currentData())
+        if InpaintThread._normalize_box_clean_mode(m.get("clean_mode")) == mode:
+            return
+        self.push_undo_current_slide()
+        m["clean_mode"] = mode
+        if self.selected_box and isinstance(self.selected_box, CanvasTextBox):
+            self.selected_box.refresh_clean_outline()
+
     # 注意：边框相关方法 (toggle_border, choose_border_color, on_border_width_changed) 已移除
     # 因为右侧面板中没有创建对应的边框控件
 
@@ -4781,7 +6170,7 @@ class PPTCloneApp(QMainWindow):
         src = self._get_selected_model()
         if not src:
             return
-        self.push_undo()
+        self.push_undo_current_slide()
         keys = [
             "use_custom_bg", "bg_color", "bg_alpha",
             "font_family", "font_size", "bold", "align", "text_color",
@@ -4813,7 +6202,7 @@ class PPTCloneApp(QMainWindow):
         if not (self.current_img and self.selected_box and isinstance(self.selected_box, CanvasTextBox)):
             return
 
-        self.push_undo()
+        self.push_undo_current_slide()
         # 从 model 中删除：用“对象身份”匹配，避免 dict 内含 numpy array 时触发 == 比较报错
         try:
             boxes = self.box_data.get(self.current_img, [])
@@ -4861,7 +6250,7 @@ class PPTCloneApp(QMainWindow):
         self.btn_pick_custom_color.setEnabled(has_sel)
 
         if self.selected_box and isinstance(self.selected_box, CanvasTextBox):
-            self.push_undo()
+            self.push_undo_current_slide()
             self.selected_box.use_custom_bg = enabled
             self.selected_box._sync_model_bg()
             self.selected_box.update_background()
@@ -4879,7 +6268,7 @@ class PPTCloneApp(QMainWindow):
         color = QColorDialog.getColor(initial_color, self, self._t("选择文本框背景色", "Choose background color"))
 
         if color.isValid():
-            self.push_undo()
+            self.push_undo_current_slide()
             self.selected_box.custom_bg_color = color
             self.selected_box.use_custom_bg = True
             self.selected_box._sync_model_bg()
@@ -4977,17 +6366,13 @@ class PPTCloneApp(QMainWindow):
         if not isinstance(src_boxes, (list, tuple)) or not src_boxes:
             return list(src_boxes) if isinstance(src_boxes, (list, tuple)) else []
 
-        # Mirror ppt_export.PPTExporter scaling logic (MAX_PPT_PIXELS).
         ppt_scale = 1.0
         try:
             from PIL import Image
 
             p = self._get_export_image_path(image_path)
             with Image.open(p) as img:
-                img_w, img_h = img.size
-            max_dim = max(int(img_w or 0), int(img_h or 0))
-            if max_dim > MAX_PPT_PIXELS:
-                ppt_scale = float(MAX_PPT_PIXELS) / float(max_dim)
+                _, _, ppt_scale = PPTExporter._scale_to_ppt_limit(*img.size)
         except Exception:
             ppt_scale = 1.0
 
@@ -5042,6 +6427,32 @@ class PPTCloneApp(QMainWindow):
 
         return out
 
+    def _collect_ppt_export_items(self):
+        items = []
+        for img_path in self.images:
+            export_path = self._get_export_image_path(img_path)
+            boxes = self._prepare_boxes_for_ppt_export(img_path, self.box_data.get(img_path, []))
+            items.append((img_path, export_path, boxes))
+        return items
+
+    def _build_ppt_exporter(self, export_items):
+        slide_size_px = PPTExporter.presentation_size_for_images([item[1] for item in export_items])
+        kwargs = {"slide_size_px": slide_size_px}
+        if self.use_text_bg:
+            color = self.text_bg_color
+            kwargs["text_bg_color"] = (color.red(), color.green(), color.blue())
+            kwargs["text_bg_alpha"] = int(getattr(self, "text_bg_alpha", 200))
+        else:
+            kwargs["text_bg_color"] = None
+        return PPTExporter(**kwargs)
+
+    def _export_ppt_to_path(self, output_path: str) -> bool:
+        export_items = self._collect_ppt_export_items()
+        exporter = self._build_ppt_exporter(export_items)
+        for _, export_path, boxes in export_items:
+            exporter.add_image_with_text_boxes(export_path, boxes)
+        return exporter.save(output_path)
+
     def export_ppt(self):
         """导出PPT"""
         if not self.images:
@@ -5057,19 +6468,7 @@ class PPTCloneApp(QMainWindow):
             return
 
         try:
-            # 收集每个文本框的颜色信息
-            # 根据配置决定是否使用背景色
-            if self.use_text_bg:
-                color = self.text_bg_color
-                exporter = PPTExporter(text_bg_color=(color.red(), color.green(), color.blue()), text_bg_alpha=int(getattr(self, "text_bg_alpha", 200)))
-            else:
-                exporter = PPTExporter(text_bg_color=None)
-
-            for img_path in self.images:
-                boxes = self._prepare_boxes_for_ppt_export(img_path, self.box_data.get(img_path, []))
-                exporter.add_image_with_text_boxes(self._get_export_image_path(img_path), boxes)
-
-            if exporter.save(save_path):
+            if self._export_ppt_to_path(save_path):
                 QMessageBox.information(self, self._t("成功", "Success"), self._t(f"PPT已导出到:\n{save_path}", f"PPT exported to:\n{save_path}"))
             else:
                 QMessageBox.warning(self, self._t("失败", "Failed"), self._t("PPT导出失败", "Failed to export PPT."))
@@ -5345,7 +6744,7 @@ class PPTCloneApp(QMainWindow):
         if not self.current_img:
             return
         try:
-            self.push_undo()
+            self.push_undo_current_slide()
         except Exception:
             pass
         try:
@@ -5425,7 +6824,7 @@ class PPTCloneApp(QMainWindow):
                 # Too small -> clear
                 self.roi_by_image.pop(self.current_img, None)
             else:
-                self.push_undo()
+                self.push_undo_current_slide()
                 self.roi_by_image[self.current_img] = [x, y, w, h]
         except Exception:
             pass
@@ -5459,7 +6858,7 @@ class PPTCloneApp(QMainWindow):
             try:
                 # Sample from what user currently sees (original vs inpainted preview).
                 img_path = self._get_display_image_path(self.current_img)
-                img = cv2.imread(img_path)
+                img = _imread_any(img_path)
                 if img is not None:
                     h, w = img.shape[:2]
                     if 0 <= x < w and 0 <= y < h:
@@ -5471,7 +6870,7 @@ class PPTCloneApp(QMainWindow):
                         if hasattr(self, 'picking_for_selected') and self.picking_for_selected:
                             # 为选中的文本框设置颜色
                             if self.selected_box and isinstance(self.selected_box, CanvasTextBox):
-                                self.push_undo()
+                                self.push_undo_current_slide()
                                 self.selected_box.custom_bg_color = picked_color
                                 self.selected_box.use_custom_bg = True
                                 self.selected_box._sync_model_bg()
@@ -5511,6 +6910,64 @@ class PPTCloneApp(QMainWindow):
             except Exception as e:
                 logger.warning(f"吸管取色失败: {e}")
 
+    def _build_preview_ppt_path(self) -> str:
+        import tempfile
+        import time
+
+        base_dir = getattr(self, "slide_assets_dir", None) or tempfile.gettempdir()
+        os.makedirs(base_dir, exist_ok=True)
+        return os.path.abspath(
+            build_asset_path(
+                base_dir,
+                "preview",
+                f"preview_{int(time.time() * 1000)}",
+                ext=".pptx",
+            )
+        )
+
+    def _wait_until_file_ready(self, path: str, timeout_sec: float = 4.0) -> None:
+        import time
+
+        last_size = -1
+        stable = 0
+        checks = max(1, int(timeout_sec / 0.05))
+        for _ in range(checks):
+            try:
+                if os.path.exists(path):
+                    sz = os.path.getsize(path)
+                    if sz > 0 and sz == last_size:
+                        stable += 1
+                    else:
+                        stable = 0
+                        last_size = sz
+                    if stable >= 3:
+                        with open(path, "rb") as _f:
+                            _f.read(1)
+                        return
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    def _open_path_with_default_app(self, path: str) -> bool:
+        import subprocess
+
+        system = platform.system()
+        if system == "Windows":
+            for _ in range(3):
+                try:
+                    os.startfile(path)
+                    return True
+                except FileNotFoundError:
+                    import time
+
+                    time.sleep(0.1)
+                except Exception:
+                    return False
+            return False
+        if system == "Darwin":
+            return subprocess.run(["open", path], check=False).returncode == 0
+        return subprocess.run(["xdg-open", path], check=False).returncode == 0
+
     def preview_ppt(self):
         """预览导出PPT"""
         if not self.images:
@@ -5522,70 +6979,14 @@ class PPTCloneApp(QMainWindow):
             return
 
         try:
-            # 创建临时PPT文件
-            import tempfile
             import time
-            # 用程序自己的临时目录：路径稳定，且不会出现 NamedTemporaryFile 在 Windows 上的偶发现象
-            base_dir = getattr(self, "slide_assets_dir", None) or tempfile.gettempdir()
-            os.makedirs(base_dir, exist_ok=True)
-            temp_path = os.path.join(base_dir, f"preview_{int(time.time() * 1000)}.pptx")
-            temp_path = os.path.abspath(temp_path)
+            temp_path = self._build_preview_ppt_path()
 
-            # 根据配置决定是否使用背景色
-            if self.use_text_bg:
-                color = self.text_bg_color
-                exporter = PPTExporter(text_bg_color=(color.red(), color.green(), color.blue()), text_bg_alpha=int(getattr(self, "text_bg_alpha", 200)))
-            else:
-                exporter = PPTExporter(text_bg_color=None)
-
-            for img_path in self.images:
-                boxes = self._prepare_boxes_for_ppt_export(img_path, self.box_data.get(img_path, []))
-                exporter.add_image_with_text_boxes(self._get_export_image_path(img_path), boxes)
-
-            if exporter.save(temp_path):
+            if self._export_ppt_to_path(temp_path):
                 # 记录创建时间，避免被过早清理导致“文件不存在”
                 self._temp_preview_ppts[temp_path] = time.time()
-
-                # 某些机器上 Office 打开前会短暂读不到文件；等待文件大小稳定 + 可读
-                last_size = -1
-                stable = 0
-                for _ in range(80):  # ~4s
-                    try:
-                        if os.path.exists(temp_path):
-                            sz = os.path.getsize(temp_path)
-                            if sz > 0 and sz == last_size:
-                                stable += 1
-                            else:
-                                stable = 0
-                                last_size = sz
-                            if stable >= 3:
-                                with open(temp_path, "rb") as _f:
-                                    _f.read(1)
-                                break
-                    except Exception:
-                        pass
-                    time.sleep(0.05)
-
-                # 使用系统默认程序打开PPT
-                import subprocess
-                import platform
-
-                system = platform.system()
-                opened = False
-                if system == "Windows":
-                    for _ in range(3):
-                        try:
-                            os.startfile(temp_path)
-                            opened = True
-                            break
-                        except FileNotFoundError:
-                            time.sleep(0.1)
-                elif system == "Darwin":  # macOS
-                    subprocess.run(["open", temp_path])
-                    opened = True
-                else:  # Linux
-                    subprocess.run(["xdg-open", temp_path])
-                    opened = True
+                self._wait_until_file_ready(temp_path)
+                opened = self._open_path_with_default_app(temp_path)
 
                 if opened:
                     QMessageBox.information(
